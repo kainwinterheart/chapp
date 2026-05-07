@@ -3,7 +3,7 @@
 import re
 
 from PyQt6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QKeyEvent, QMouseEvent, QPainter, QPen, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QAction, QColor, QKeyEvent, QMouseEvent, QPainter, QPalette, QPen, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QDialog,
     QApplication,
@@ -510,7 +510,12 @@ class _UnifiedTitleBar(QWidget):
         self.setFixedHeight(_TITLE_BAR_HEIGHT)
 
         # ── macOS fix: ensure the title bar is opaque ───────────────────
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        # Palette + explicit stylesheet.  The stylesheet targets this widget
+        # directly (not via a QWidget selector) so it always wins.
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor("#1e1e2e"))
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
         self.setStyleSheet("background-color: #1e1e2e;")
 
         self._parent_win = parent
@@ -950,6 +955,18 @@ class ChatWindow(QWidget, _FramelessMixin):
         # Strip the native window frame
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
 
+        # ── macOS fix: opaque window background ─────────────────────────
+        # FramelessWindowHint on macOS makes the window translucent at the
+        # compositor level.  Set both palette and explicit stylesheet so
+        # the background is opaque everywhere.
+        win_pal = self.palette()
+        win_pal.setColor(QPalette.ColorRole.Window, QColor("#1e1e2e"))
+        self.setPalette(win_pal)
+        self.setAutoFillBackground(True)
+        # Target this specific widget (not the generic QWidget selector) so
+        # it beats the app-level stylesheet on macOS frameless windows.
+        self.setStyleSheet("ChatWindow { background-color: #1e1e2e; }")
+
         self.setWindowTitle("Chat Window")
         self.resize(900, 600)
 
@@ -1060,6 +1077,13 @@ class ChatWindow(QWidget, _FramelessMixin):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._resize_title_bar()
+
+    def paintEvent(self, event):
+        """Force opaque background on macOS frameless windows."""
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#1e1e2e"))
+        painter.end()
+        super().paintEvent(event)
 
     # ── Event filter (resize borders + keyboard) ───────────────────────
 
