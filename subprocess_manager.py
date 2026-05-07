@@ -100,9 +100,11 @@ class Worker(QObject):
             else:
                 session_id = None
 
+            if session_id:
+                self.signal_completed.emit(stdout, session_id)
+
             if not stdout:
                 raise RuntimeError("Empty output, likely timeout issue")
-            self.signal_completed.emit(stdout, session_id)
         except FileNotFoundError:
             try:
                 self.signal_error.emit("codex binary not found")
