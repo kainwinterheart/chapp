@@ -8,15 +8,20 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from settings import _SETTINGS_DIR
+
 
 class DataPersistenceManager:
     """Manages conversation persistence using per-conversation JSON files
-    stored in a dist/ directory, with an index file for ordering."""
+    stored in a subdirectory of the settings directory, with an index file for ordering."""
 
-    MAX_CONVERSATIONS = 20
+    MAX_CONVERSATIONS = 50
 
-    def __init__(self, data_dir: str = "dist") -> None:
-        self._data_dir = Path(data_dir)
+    def __init__(self, data_dir: str | None = None) -> None:
+        if data_dir is not None:
+            self._data_dir = Path(data_dir)
+        else:
+            self._data_dir = Path(_SETTINGS_DIR) / "conversations"
         self._conversations: dict[str, dict] = {}
         self._index: list[dict] = []
         self._active_conversation_id: Optional[str] = None
@@ -63,14 +68,17 @@ class DataPersistenceManager:
     def load_all(self) -> None:
         """Load all conversations from disk into memory."""
         self._conversations.clear()
-        self._index.clear()
         self._active_conversation_id = None
 
         index_data = self._load_json_safe(self._index_path())
         if not isinstance(index_data, list):
             return
 
-        self._index = index_data
+        # Only load the newest MAX_CONVERSATIONS entries from the index.
+        # Oldest entries sit at the end of the list.
+        trimmed = index_data[:self.MAX_CONVERSATIONS]
+
+        self._index = trimmed
 
         for entry in self._index:
             conv_id = entry.get("id")
@@ -99,10 +107,11 @@ class DataPersistenceManager:
         """
         return str(uuid.uuid4())
 
-    def _evict_if_needed(self) -> None:
-        """Evict oldest conversations if MAX_CONVERSATIONS is exceeded.
+    def _evict_from_index(self) -> None:
+        """Remove oldest entries from index if MAX_CONVERSATIONS is exceeded.
 
         Oldest entries are at the END of the index (index[0] is newest).
+        Files are left on disk untouched.
         """
         while len(self._index) > self.MAX_CONVERSATIONS:
             oldest = self._index.pop()
@@ -112,11 +121,6 @@ class DataPersistenceManager:
             if not oldest_id:
                 continue
             self._conversations.pop(oldest_id, None)
-            conv_path = self._conversation_path(oldest_id)
-            try:
-                conv_path.unlink(missing_ok=True)
-            except OSError:
-                pass
             # Reset active if the evicted conversation was the active one.
             if self._active_conversation_id == oldest_id:
                 if self._index:
@@ -142,8 +146,7 @@ class DataPersistenceManager:
         self._conversations[conversation_id] = conv_data
         self._active_conversation_id = conversation_id
         self._ensure_dir()
-        # Evict BEFORE disk writes to avoid writing evicted data.
-        self._evict_if_needed()
+        self._evict_from_index()
         self._atomic_write(self._conversation_path(conversation_id), conv_data)
         self._atomic_write(self._index_path(), self._index)
 
@@ -168,8 +171,7 @@ class DataPersistenceManager:
         self._conversations[conversation_id] = conv_data
         self._active_conversation_id = conversation_id
         self._ensure_dir()
-        # Evict BEFORE disk writes to avoid writing evicted data.
-        self._evict_if_needed()
+        self._evict_from_index()
         # Write conversation file first so it's never in a zero-message state.
         self._atomic_write(self._conversation_path(conversation_id), conv_data)
         self._atomic_write(self._index_path(), self._index)

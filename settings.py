@@ -6,6 +6,24 @@ import os
 _SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "ac_chapp")
 _SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "settings.json")
 
+DEFAULT_FONT_SIZES = {
+    "base": 13,
+    "stderr": 8,
+    "title_bar": 12,
+    "settings_label": 13,
+    "settings_input": 13,
+    "settings_button": 12,
+}
+
+
+def read_font_sizes() -> dict:
+    """Read font sizes from settings, merging with defaults."""
+    settings = read_settings()
+    saved = settings.get("font_sizes", {})
+    result = dict(DEFAULT_FONT_SIZES)
+    result.update(saved)
+    return result
+
 
 def read_settings() -> dict:
     """Read settings from ~/.config/ac_chapp/settings.json."""

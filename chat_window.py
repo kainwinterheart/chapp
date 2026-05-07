@@ -3,7 +3,7 @@
 import re
 
 from PyQt6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QKeyEvent, QMouseEvent, QPainter, QPalette, QPen, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QAction, QColor, QKeyEvent, QMouseEvent, QPainter, QFont, QPalette, QPen, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QDialog,
     QApplication,
@@ -16,16 +16,23 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QScrollArea,
+    QSlider,
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from data_persistence import DataPersistenceManager
-from settings import read_settings as _read_settings, save_settings as _save_settings
+from settings import (
+    DEFAULT_FONT_SIZES,
+    read_font_sizes as _read_font_sizes,
+    read_settings as _read_settings,
+    save_settings as _save_settings,
+)
 from subprocess_manager import SubprocessManager
 
 # ── Shared constants ───────────────────────────────────────────────────────
@@ -343,14 +350,86 @@ class _TitleBarButton(QPushButton):
 
 # ── Settings Dialog ──────────────────────────────────────────────────────
 
+class _FontSizeRow(QWidget):
+    """A single font-size control row with label + slider + numeric input."""
+
+    value_changed = pyqtSignal(str, int)
+
+    def __init__(self, label: str, key: str, value: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._key = key
+        self._label: QLabel | None = None
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        lbl = QLabel(label)
+        self._label = lbl
+        lbl.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        row.addWidget(lbl, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(6, 24)
+        self._slider.setValue(value)
+        self._slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #313244;
+                height: 4px;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #89b4fa;
+                width: 12px;
+                margin: -4px 0;
+                border-radius: 6px;
+            }
+        """)
+        self._slider.valueChanged.connect(self._on_slider)
+        row.addWidget(self._slider, 1)
+
+        self._spin = QSpinBox()
+        self._spin.setRange(6, 24)
+        self._spin.setValue(value)
+        self._spin.setStyleSheet("""
+            QSpinBox {
+                background-color: #313244;
+                color: #cdd6f4;
+                border: none;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-size: 12px;
+                width: 40px;
+            }
+        """)
+        self._spin.valueChanged.connect(self._on_spin)
+        row.addWidget(self._spin, 0)
+
+    def _on_slider(self, val: int) -> None:
+        self._spin.blockSignals(True)
+        self._spin.setValue(val)
+        self._spin.blockSignals(False)
+        self.value_changed.emit(self._key, val)
+
+    def _on_spin(self, val: int) -> None:
+        self._slider.blockSignals(True)
+        self._slider.setValue(val)
+        self._slider.blockSignals(False)
+        self.value_changed.emit(self._key, val)
+
+    def get_value(self) -> int:
+        return self._spin.value()
+
+
 class SettingsDialog(QDialog, _FramelessMixin):
-    """Modal dialog for configuring the subprocess binary path.
+    """Modal dialog for configuring binary path and font sizes.
 
     Uses the same frameless style, shadow, resize borders, and title bar as
     the main chat window.
     """
 
     _title_bar_height = _TITLE_BAR_HEIGHT
+    fonts_changed = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -359,20 +438,11 @@ class SettingsDialog(QDialog, _FramelessMixin):
             | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setWindowTitle("Settings")
-        self.setMinimumSize(400, 140)
-        self.setFixedSize(400, 180)
 
-        # Visible border so the dialog doesn't blend into the main window
         self.setStyleSheet("QDialog { border: 1px solid #313244; border-radius: 8px; background-color: #1e1e2e; }")
 
-        # Frameless window plumbing
         self._apply_shadow()
-        # NOTE: we deliberately do NOT install a global event filter on the
-        # dialog – the parent window's filter already handles global events.
-        # Installing one here caused the dialog to intercept clicks on the
-        # parent window and close itself.
 
-        # Title bar (shared widget)
         self._tbar = _UnifiedTitleBar(
             self,
             buttons=[CloseButton(self)],
@@ -383,80 +453,88 @@ class SettingsDialog(QDialog, _FramelessMixin):
         self._tbar.setParent(self)
         self._tbar.raise_()
 
-        # Body
-        current = _read_settings().get("binary_path", "")
+        # Read current settings
+        self._binary_path = _read_settings().get("binary_path", "")
+        font_sizes = _read_font_sizes()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, _TITLE_BAR_HEIGHT + 8, 16, 16)
         layout.setSpacing(12)
 
-        # Label
-        label = QLabel("Binary path:")
-        label.setStyleSheet("color: #a6adc8; font-size: 13px;")
-        layout.addWidget(label)
+        # Store references for font styling
+        self._styled_labels: list[QLabel] = []
+        self._styled_inputs: list[QWidget] = []
+        self._styled_buttons: list[QPushButton] = []
 
-        # Path input row
+        # ── Section header ──────────────────────────────────────────────
+        header = QLabel("Appearance")
+        layout.addWidget(header)
+        self._styled_labels.append(header)
+
+        # ── Font size rows ──────────────────────────────────────────────
+        self._font_rows: list[_FontSizeRow] = []
+        font_labels = {
+            "base": "Base text",
+            "stderr": "Stderr / system",
+            "title_bar": "Title bar",
+            "settings_label": "Settings labels",
+            "settings_input": "Settings input",
+            "settings_button": "Settings buttons",
+        }
+        for key, label in font_labels.items():
+            row = _FontSizeRow(label, key, font_sizes.get(key, DEFAULT_FONT_SIZES[key]))
+            row.value_changed.connect(self._on_font_change)
+            layout.addWidget(row)
+            self._font_rows.append(row)
+            if row._label:
+                self._styled_labels.append(row._label)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        sep.setStyleSheet("background-color: #313244;")
+        layout.addWidget(sep)
+
+        # ── Binary path section ─────────────────────────────────────────
+        path_header = QLabel("Subprocess")
+        layout.addWidget(path_header)
+        self._styled_labels.append(path_header)
+
         path_row = QHBoxLayout()
         self._path_edit = QTextEdit()
-        self._path_edit.setPlainText(current)
-        self._path_edit.setMaximumHeight(60)
-        self._path_edit.setStyleSheet("""
-            QTextEdit {
-                background-color: #1e1e2e;
-                color: #cdd6f4;
-                border: 1px solid #313244;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-family: monospace;
-                font-size: 13px;
-            }
-        """)
+        self._path_edit.setPlainText(self._binary_path)
+        self._path_edit.setMaximumHeight(40)
         path_row.addWidget(self._path_edit, 1)
+        self._styled_inputs.append(self._path_edit)
 
         browse_btn = QPushButton("Browse")
-        browse_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #313244;
-                color: #cdd6f4;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 14px;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #45475a; }
-        """)
         browse_btn.clicked.connect(self._browse_file)
         path_row.addWidget(browse_btn)
+        self._styled_buttons.append(browse_btn)
         layout.addLayout(path_row)
 
-        # Buttons
+        # ── Buttons ─────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.addStretch()
 
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setStyleSheet(browse_btn.styleSheet())
         cancel_btn.clicked.connect(self.reject)
-
         save_btn = QPushButton("Save")
-        save_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #89b4fa;
-                color: #1e1e2e;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 14px;
-                font-weight: bold;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #74c7ec; }
-        """)
         save_btn.clicked.connect(self._save)
 
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(save_btn)
         layout.addLayout(btn_row)
+        self._styled_buttons.extend([cancel_btn, save_btn])
 
+        # Apply font sizes to all widgets
+        self._apply_dialog_fonts(font_sizes)
         self._resize_title_bar()
+
+        # Finalize size now that layout is fully built — let Qt measure it
+        self.adjustSize()
+        self.setMinimumSize(480, self.height())
 
     def _resize_title_bar(self) -> None:
         if hasattr(self, "_tbar"):
@@ -473,6 +551,62 @@ class SettingsDialog(QDialog, _FramelessMixin):
             return True
         return super().eventFilter(obj, event)  # type: ignore[misc]
 
+    # ── Font styling ──────────────────────────────────────────────────
+
+    def _apply_dialog_fonts(self, font_sizes: dict) -> None:
+        """Apply stored font sizes to all dialog widgets."""
+        label_size = font_sizes.get("settings_label", 13)
+        input_size = font_sizes.get("settings_input", 13)
+        button_size = font_sizes.get("settings_button", 12)
+
+        for lbl in self._styled_labels:
+            lbl.setStyleSheet(f"color: #a6adc8; font-size: {label_size}px;")
+        for inp in self._styled_inputs:
+            inp.setStyleSheet("""
+                QTextEdit {
+                    background-color: #1e1e2e;
+                    color: #cdd6f4;
+                    border: 1px solid #313244;
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                    font-family: monospace;
+                    font-size: %(input_size)spx;
+                }
+            """ % {"input_size": input_size})
+        for btn in self._styled_buttons:
+            if btn.text() == "Save":
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #89b4fa;
+                        color: #1e1e2e;
+                        border: none;
+                        border-radius: 4px;
+                        padding: 6px 14px;
+                        font-weight: bold;
+                        font-size: %(btn_size)spx;
+                    }
+                    QPushButton:hover { background-color: #74c7ec; }
+                """ % {"btn_size": button_size})
+            else:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #313244;
+                        color: #cdd6f4;
+                        border: none;
+                        border-radius: 4px;
+                        padding: 6px 14px;
+                        font-size: %(btn_size)spx;
+                    }
+                    QPushButton:hover { background-color: #45475a; }
+                """ % {"btn_size": button_size})
+
+    def _on_font_change(self, key: str, value: int) -> None:
+        """Apply font sizes live as slider changes."""
+        font_sizes = self.get_font_sizes()
+        self._apply_dialog_fonts(font_sizes)
+        # Notify main window to update its own widgets
+        self.fonts_changed.emit()
+
     # ── Actions ─────────────────────────────────────────────────────────
 
     def _browse_file(self) -> None:
@@ -483,14 +617,32 @@ class SettingsDialog(QDialog, _FramelessMixin):
             self._path_edit.setPlainText(path)
 
     def _save(self) -> None:
-        path = self._path_edit.toPlainText().strip()
         settings = _read_settings()
+        path = self._path_edit.toPlainText().strip()
         if path:
             settings["binary_path"] = path
         else:
             settings.pop("binary_path", None)
+
+        font_sizes = {}
+        for row in self._font_rows:
+            key = row._key  # type: ignore[attr-defined]
+            font_sizes[key] = row.get_value()
+        settings["font_sizes"] = font_sizes
+
         _save_settings(settings)
+        # Apply fonts to dialog widgets so they reflect saved values
+        self._apply_dialog_fonts(font_sizes)
+        self.fonts_changed.emit()
         self.accept()
+
+    def get_font_sizes(self) -> dict:
+        """Return current font size values from all sliders."""
+        sizes = dict(DEFAULT_FONT_SIZES)
+        for row in self._font_rows:
+            key = row._key  # type: ignore[attr-defined]
+            sizes[key] = row.get_value()
+        return sizes
 
 
 # ── Unified title bar ───────────────────────────────────────────────────
@@ -505,7 +657,8 @@ class _UnifiedTitleBar(QWidget):
     settings_requested = pyqtSignal()
 
     def __init__(self, parent, buttons=None, title="Chapp",
-                 on_double_click='maximize', has_context_menu=False):
+                 on_double_click='maximize', has_context_menu=False,
+                 font_size: int = 12):
         super().__init__(parent)
         self.setFixedHeight(_TITLE_BAR_HEIGHT)
 
@@ -546,15 +699,19 @@ class _UnifiedTitleBar(QWidget):
 
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet(
-            "color: #a6adc8; font-size: 12px; font-weight: bold; background: transparent;"
+            f"color: #a6adc8; font-size: {font_size}px; font-weight: bold; background: transparent;"
         )
+        self._font_size = font_size
         layout.addWidget(self.title_label, 1)
         layout.addStretch(1)
         layout.addLayout(btn_layout)
 
-        # ── Install event filter on parent for window-state tracking ─────
-        if on_double_click == 'maximize':
-            self._parent_win.installEventFilter(self)
+    def apply_font_size(self, size: int) -> None:
+        """Update the title label font size."""
+        self._font_size = size
+        self.title_label.setStyleSheet(
+            f"color: #a6adc8; font-size: {size}px; font-weight: bold; background: transparent;"
+        )
 
     # ── Event filter (sync maximise button state) ───────────────────────
 
@@ -799,8 +956,9 @@ class SidebarPanel(QWidget):
 class MessageLogPanel(QWidget):
     """Center panel displaying message history with optional stderr overlay."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, font_sizes: dict | None = None):
         super().__init__(parent)
+        self._font_sizes = font_sizes or {}
 
         self._text_edit = QTextEdit()
         self._text_edit.setReadOnly(True)
@@ -814,13 +972,18 @@ class MessageLogPanel(QWidget):
         self._stderr_flush_timer.timeout.connect(self._flush_stderr_buffer)
 
         self._stderr_fmt = QTextCharFormat()
-        self._stderr_fmt.setFontPointSize(8)
+        self._stderr_fmt.setFontPointSize(float(self._font_sizes.get("stderr", 8)))
         self._stderr_fmt.setForeground(QColor("#f38ba8"))
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._text_edit)
         self.setLayout(layout)
+
+    def apply_font_sizes(self, font_sizes: dict) -> None:
+        """Reapply font sizes after settings change."""
+        self._font_sizes = font_sizes
+        self._stderr_fmt.setFontPointSize(float(font_sizes.get("stderr", 8)))
 
     def append_message(self, role: str, content: str):
         """Append a styled message block to the log."""
@@ -970,6 +1133,9 @@ class ChatWindow(QWidget, _FramelessMixin):
         self.setWindowTitle("Chat Window")
         self.resize(900, 600)
 
+        # Load font sizes from settings
+        self._font_sizes = _read_font_sizes()
+
         # Title bar
         self.custom_title_bar = _UnifiedTitleBar(
             self,
@@ -977,6 +1143,7 @@ class ChatWindow(QWidget, _FramelessMixin):
             title="Chapp",
             on_double_click='maximize',
             has_context_menu=True,
+            font_size=self._font_sizes.get("title_bar", 12),
         )
         self.custom_title_bar.settings_requested.connect(self._open_settings)
         self.custom_title_bar.setParent(self)
@@ -994,7 +1161,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         self.subprocess_mgr = SubprocessManager(schema, timeout)
 
         self.sidebar = SidebarPanel()
-        self.message_log = MessageLogPanel()
+        self.message_log = MessageLogPanel(font_sizes=self._font_sizes)
         self.input_bar = InputBar()
 
         # Wire subprocess signals
@@ -1067,6 +1234,46 @@ class ChatWindow(QWidget, _FramelessMixin):
         self._refresh_sidebar()
 
         self._load_conversation_messages(self.persistence.get_active_conversation_id())
+
+        # Apply font sizes after everything is set up to avoid interfering with rendering
+        self._apply_font_sizes(self._font_sizes)
+
+    # ── Font size helpers ─────────────────────────────────────────────
+
+    def _apply_base_font(self, font_sizes: dict) -> None:
+        """Set base font on text-displaying widgets in the main window."""
+        base = font_sizes.get("base", 13)
+        font = QFont("monospace", int(base))
+        for widget in self.findChildren(QWidget):
+            # Skip dialog descendants — they manage their own fonts
+            parent = widget.parent()
+            in_dialog = False
+            while parent:
+                if isinstance(parent, QDialog):
+                    in_dialog = True
+                    break
+                parent = parent.parent()
+            if in_dialog:
+                continue
+            if isinstance(widget, QTextEdit):
+                # QTextEdit ignores widget.setFont() for existing content.
+                # Must set on the document itself.
+                widget.document().setDefaultFont(font)
+            else:
+                widget.setFont(font)
+
+    def _apply_font_sizes(self, font_sizes: dict) -> None:
+        """Apply font sizes to all widgets and update app stylesheet."""
+        self._apply_base_font(font_sizes)
+        # Update app-level stylesheet so QPushButton (etc.) inherit correctly
+        base = font_sizes.get("base", 13)
+        QApplication.instance().setStyleSheet(
+            STYLESHEET.replace("font-size: 13px;", f"font-size: {base}px;")
+        )
+        # Update title bar
+        self.custom_title_bar.apply_font_size(font_sizes.get("title_bar", 12))
+        # Update message log stderr font
+        self.message_log.apply_font_sizes(font_sizes)
 
     # ── Layout helpers ──────────────────────────────────────────────────
 
@@ -1183,4 +1390,5 @@ class ChatWindow(QWidget, _FramelessMixin):
     def _open_settings(self):
         """Open the settings modal dialog."""
         dlg = SettingsDialog(self)
+        dlg.fonts_changed.connect(lambda: self._apply_font_sizes(dlg.get_font_sizes()))
         dlg.exec()
