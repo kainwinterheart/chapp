@@ -373,7 +373,13 @@ class SettingsDialog(QDialog, _FramelessMixin):
         # parent window and close itself.
 
         # Title bar (shared widget)
-        self._tbar = SettingsDialog._SettingsTitleBar(self)
+        self._tbar = _UnifiedTitleBar(
+            self,
+            buttons=[CloseButton(self)],
+            title="Settings",
+            on_double_click='close',
+            has_context_menu=False,
+        )
         self._tbar.setParent(self)
         self._tbar.raise_()
 
@@ -460,62 +466,6 @@ class SettingsDialog(QDialog, _FramelessMixin):
         super().resizeEvent(event)
         self._resize_title_bar()
 
-    # ── Title bar (minimal — no drag / maximise) ──────────────────────
-
-    class _SettingsTitleBar(QWidget):
-        """Compact title bar for SettingsDialog — matches main window style."""
-
-        def __init__(self, parent: QDialog):
-            super().__init__(parent)
-            self._parent_win = parent
-            self.setFixedHeight(_TITLE_BAR_HEIGHT)
-
-            # Same close button as the main window
-            self.close_btn = CloseButton(self)
-
-            # Button layout (right-aligned, no spacing)
-            btn_layout = QHBoxLayout()
-            btn_layout.setContentsMargins(0, 0, 0, 0)
-            btn_layout.setSpacing(_BUTTON_SPACING)
-            btn_layout.addWidget(self.close_btn)
-
-            # Main layout — mirrors TitleBar structure
-            layout = QHBoxLayout(self)
-            layout.setContentsMargins(4, 0, 4, 0)
-            layout.setSpacing(6)
-            layout.addSpacing(ICON_SPACER)
-            title_lbl = QLabel("Settings")
-            title_lbl.setStyleSheet(
-                "color: #a6adc8; font-size: 12px; font-weight: bold; background: transparent;"
-            )
-            layout.addWidget(title_lbl, 1)
-            layout.addStretch(1)
-            layout.addLayout(btn_layout)
-
-        # ── Drag support ────────────────────────────────────────────────
-
-        def _can_drag(self, pos: QPoint) -> bool:
-            width = self.close_btn.width() if self.close_btn.isVisible() else 0
-            return 0 < pos.x() < self.width() - width
-
-        def mousePressEvent(self, event: QMouseEvent) -> None:
-            if (event.button() == Qt.MouseButton.LeftButton
-                    and self._can_drag(event.pos())):
-                self._parent_win.windowHandle().startSystemMove()
-                event.accept()
-            elif event.button() == Qt.MouseButton.LeftButton:
-                super().mousePressEvent(event)
-
-        def mouseMoveEvent(self, event: QMouseEvent) -> None:
-            if (event.buttons() & Qt.MouseButton.LeftButton
-                    and self._can_drag(event.pos())):
-                self._parent_win.windowHandle().startSystemMove()
-
-        def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-            # Double-click on title bar area → close
-            if event.button() == Qt.MouseButton.LeftButton:
-                self._parent_win.reject()
-
     # ── Event filter (resize borders + keyboard) ───────────────────────
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
@@ -543,7 +493,124 @@ class SettingsDialog(QDialog, _FramelessMixin):
         self.accept()
 
 
-# ── Custom Title Bar with native system drag ─────────────────────────────
+# ── Unified title bar ───────────────────────────────────────────────────
+
+class _UnifiedTitleBar(QWidget):
+    """Shared title bar for frameless windows (ChatWindow + SettingsDialog).
+
+    Handles: drag-to-move, double-click action (maximise or close),
+    optional right-click context menu, and macOS opaque background.
+    """
+
+    settings_requested = pyqtSignal()
+
+    def __init__(self, parent, buttons=None, title="Chapp",
+                 on_double_click='maximize', has_context_menu=False):
+        super().__init__(parent)
+        self.setFixedHeight(_TITLE_BAR_HEIGHT)
+
+        # ── macOS fix: ensure the title bar is opaque ───────────────────
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setStyleSheet("background-color: #1e1e2e;")
+
+        self._parent_win = parent
+        self._on_double_click = on_double_click
+        self._buttons = list(buttons or [])
+        for btn in self._buttons:
+            btn.setParent(self)
+
+        # ── Context menu (main window only) ─────────────────────────────
+        self._context_menu = None
+        if has_context_menu:
+            self._context_menu = QMenu(self)
+            self._settings_action = QAction("Settings", self)
+            self._settings_action.triggered.connect(self.settings_requested.emit)
+            self._context_menu.addAction(self._settings_action)
+
+        # ── Layout ──────────────────────────────────────────────────────
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(_BUTTON_SPACING)
+        for btn in self._buttons:
+            btn_layout.addWidget(btn)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+        layout.addSpacing(ICON_SPACER)
+
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet(
+            "color: #a6adc8; font-size: 12px; font-weight: bold; background: transparent;"
+        )
+        layout.addWidget(self.title_label, 1)
+        layout.addStretch(1)
+        layout.addLayout(btn_layout)
+
+        # ── Install event filter on parent for window-state tracking ─────
+        if on_double_click == 'maximize':
+            self._parent_win.installEventFilter(self)
+
+    # ── Event filter (sync maximise button state) ───────────────────────
+
+    def eventFilter(self, obj, event):
+        if obj is self._parent_win and event.type() == QEvent.Type.WindowStateChange:
+            for btn in self._buttons:
+                if isinstance(btn, MaximizeButton):
+                    btn.set_max_state(self._parent_win.isMaximized())
+        return super().eventFilter(obj, event)
+
+    # ── Drag helpers ────────────────────────────────────────────────────
+
+    def _is_drag_region(self, pos):
+        width = sum(btn.width() for btn in self._buttons if btn.isVisible())
+        return 0 < pos.x() < self.width() - width
+
+    def _has_button_pressed(self):
+        return any(
+            getattr(btn, '_state', _TITLE_BAR_NORMAL) == _TITLE_BAR_PRESSED
+            for btn in self._buttons
+        )
+
+    def _can_drag(self, pos):
+        return self._is_drag_region(pos) and not self._has_button_pressed()
+
+    # ── Mouse events ────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.RightButton:
+            if self._context_menu:
+                self._context_menu.exec(event.globalPosition().toPoint())
+                event.accept()
+            return
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._can_drag(event.pos())):
+            self._parent_win.windowHandle().startSystemMove()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if (event.buttons() & Qt.MouseButton.LeftButton
+                and self._can_drag(event.pos())):
+            self._parent_win.windowHandle().startSystemMove()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.RightButton:
+            return
+        if self._on_double_click == 'maximize':
+            if self._parent_win.isMaximized():
+                self._parent_win.showNormal()
+            else:
+                self._parent_win.showMaximized()
+        elif self._on_double_click == 'close':
+            if hasattr(self._parent_win, 'reject'):
+                self._parent_win.reject()
+            else:
+                self._parent_win.close()
+
+
+# ── Title bar button classes ─────────────────────────────────────────────
 
 class CloseButton(_TitleBarButton):
     """Styled close button with red hover state."""
@@ -653,105 +720,6 @@ class MaximizeButton(_TitleBarButton):
             painter.drawRect(o, o + 4, s - 2, s - 2)
             painter.drawLine(o + 2, o + 4, o + 2, o + 2)
             painter.drawLine(o + 2, o + 2, o + s, o + 2)
-
-
-class TitleBar(QWidget):
-    """Custom title bar with native system drag."""
-
-    settings_requested = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(_TITLE_BAR_HEIGHT)
-
-        self.window().installEventFilter(self)
-
-        # Context menu
-        self._context_menu = QMenu(self)
-        self._settings_action = QAction("Settings", self)
-        self._settings_action.triggered.connect(self._on_settings)
-        self._context_menu.addAction(self._settings_action)
-
-        # Buttons
-        self.min_btn = MinimizeButton(self)
-        self.max_btn = MaximizeButton(self)
-        self.close_btn = CloseButton(self)
-
-        # Title label
-        self.title_label = QLabel("Chapp")
-        self.title_label.setStyleSheet(
-            "color: #a6adc8; font-size: 12px; font-weight: bold; background: transparent;"
-        )
-
-        # Button layout (right-aligned, no spacing)
-        btn_layout = QHBoxLayout()
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(_BUTTON_SPACING)
-        btn_layout.addWidget(self.min_btn)
-        btn_layout.addWidget(self.max_btn)
-        btn_layout.addWidget(self.close_btn)
-
-        # Main layout
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(6)
-        layout.addSpacing(ICON_SPACER)  # icon spacer
-        layout.addWidget(self.title_label, 1)
-        layout.addStretch(1)
-        layout.addLayout(btn_layout)
-
-    def eventFilter(self, obj, event):
-        if obj is self.window() and event.type() == QEvent.Type.WindowStateChange:
-            self.max_btn.set_max_state(self.window().isMaximized())
-        return super().eventFilter(obj, event)
-
-    def _is_drag_region(self, pos):
-        """Check if position is in the draggable area (excluding buttons)."""
-        width = 0
-        for btn in [self.min_btn, self.max_btn, self.close_btn]:
-            if btn.isVisible():
-                width += btn.width()
-        return 0 < pos.x() < self.width() - width
-
-    def _has_button_pressed(self):
-        """Check if any button is currently in pressed state."""
-        return any(
-            btn._state == _TITLE_BAR_PRESSED
-            for btn in [self.min_btn, self.max_btn, self.close_btn]
-        )
-
-    def _can_drag(self, pos):
-        return self._is_drag_region(pos) and not self._has_button_pressed()
-
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.RightButton:
-            self._context_menu.exec(event.globalPosition().toPoint())
-            event.accept()
-            return
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self._can_drag(event.pos())):
-            self.window().windowHandle().startSystemMove()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if (event.buttons() & Qt.MouseButton.LeftButton
-                and self._can_drag(event.pos())):
-            self.window().windowHandle().startSystemMove()
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.RightButton:
-            return
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self._can_drag(event.pos())):
-            if self.window().isMaximized():
-                self.window().showNormal()
-            else:
-                self.window().showMaximized()
-
-    def _on_settings(self):
-        self.settings_requested.emit()
 
 
 # ── SidebarPanel ─────────────────────────────────────────────────────────
@@ -986,7 +954,13 @@ class ChatWindow(QWidget, _FramelessMixin):
         self.resize(900, 600)
 
         # Title bar
-        self.custom_title_bar = TitleBar(self)
+        self.custom_title_bar = _UnifiedTitleBar(
+            self,
+            buttons=[MinimizeButton(self), MaximizeButton(self), CloseButton(self)],
+            title="Chapp",
+            on_double_click='maximize',
+            has_context_menu=True,
+        )
         self.custom_title_bar.settings_requested.connect(self._open_settings)
         self.custom_title_bar.setParent(self)
         self.custom_title_bar.raise_()
