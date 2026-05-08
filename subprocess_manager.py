@@ -50,9 +50,7 @@ class Worker(QObject):
             bad = 0
             stderr_fd = process.stderr.fileno()
 
-            while True:
-                if self._kill_requested:
-                    raise KeyboardInterrupt("Kill requested")
+            while not self._kill_requested:
                 if bad >= 100:
                     break
                 try:
@@ -72,9 +70,7 @@ class Worker(QObject):
                         time.sleep(0.1)
 
             bad = 0
-            while True:
-                if self._kill_requested:
-                    raise KeyboardInterrupt("Kill requested")
+            while not self._kill_requested:
                 if bad >= 100:
                     break
                 try:
@@ -88,23 +84,20 @@ class Worker(QObject):
                     if (bad % 10) == 0:
                         time.sleep(0.1)
 
-            process.wait()
+            if not self._kill_requested:
+                process.wait()
 
             stdout = combined_stdout.strip()
 
+            session_id = None
             if match := re.search(r"session id:\s*(\S*)", combined_stderr):
-                if match.group(1) == "":
-                    session_id = None
-                else:
-                    session_id = match.group(1)
-            else:
-                session_id = None
+                session_id = match.group(1) or None
 
             if session_id:
                 self.signal_completed.emit(stdout, session_id)
 
             if not stdout:
-                raise RuntimeError("Empty output, likely timeout issue")
+                raise RuntimeError("Empty output")
         except FileNotFoundError:
             try:
                 self.signal_error.emit("codex binary not found")
@@ -119,7 +112,7 @@ class Worker(QObject):
             self.signal_finished.emit()
         except RuntimeError:
             try:
-                self.signal_error.emit("Empty output, likely timeout issue")
+                self.signal_error.emit("Empty output")
             except Exception:
                 pass
             self.signal_finished.emit()
@@ -133,9 +126,12 @@ class Worker(QObject):
                 pass
             self.signal_finished.emit()
         finally:
-            if process is not None and process.returncode is None:
-                process.kill()
-                process.wait()
+            try:
+                if process is not None and process.returncode is None:
+                    process.kill()
+                    process.wait()
+            except:
+                pass
 
 
 class SubprocessManager(QObject):
@@ -173,6 +169,7 @@ class SubprocessManager(QObject):
         return cmd
 
     def _handle_worker_finished(self) -> None:
+        self.signal_kill_requested.disconnect()
         self._running = False
         thread = self._thread
         if thread is None:
@@ -213,7 +210,7 @@ class SubprocessManager(QObject):
             lambda: setattr(worker, "_kill_requested", True),
             Qt.ConnectionType.QueuedConnection,
         )
-        thread.finished.connect(lambda: (worker.deleteLater(), thread.deleteLater()))
+        thread.finished.connect(worker.deleteLater)
         worker.moveToThread(thread)
         thread.started.connect(worker.execute)
 
