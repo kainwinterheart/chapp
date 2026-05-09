@@ -1037,11 +1037,12 @@ class MessageLogPanel(QWidget):
         self._text_edit.setReadOnly(True)
         self._stderr_marker_pos = None
 
-        # Chunk buffering
-        self._stderr_buffer = ""
+        # Stderr line buffer (keeps last 50 lines)
+        self._stderr_text = ""
+        self._MAX_STDERR_LINES = 50
         self._stderr_flush_timer = QTimer(self)
-        self._stderr_flush_timer.setSingleShot(True)
-        self._stderr_flush_timer.setInterval(16)
+        self._stderr_flush_timer.setSingleShot(False)
+        self._stderr_flush_timer.setInterval(200)
         self._stderr_flush_timer.timeout.connect(self._flush_stderr_buffer)
 
         self._stderr_fmt = QTextCharFormat()
@@ -1160,24 +1161,34 @@ class MessageLogPanel(QWidget):
         self._stderr_marker_pos = cursor.position()
 
     def append_stderr_chunk(self, chunk: str):
-        """Buffer a stderr chunk and schedule a periodic flush."""
-        self._stderr_buffer += chunk
+        """Append chunk to internal line buffer."""
+        self._stderr_text += chunk
         self._stderr_flush_timer.start()
 
     def _flush_stderr_buffer(self):
-        """Flush buffered stderr into the document in a single operation."""
-        if not self._stderr_buffer:
+        """Truncate buffer to last N lines, then replace stderr region."""
+        if not self._stderr_text:
             return
-        text, self._stderr_buffer = self._stderr_buffer, ""
+        if self._stderr_marker_pos is None:
+            return
+
+        # Truncate to last MAX_STDERR_LINES
+        lines = self._stderr_text.splitlines(keepends=True)
+        if len(lines) > self._MAX_STDERR_LINES:
+            self._stderr_text = "".join(lines[-self._MAX_STDERR_LINES:])
+
         cursor = QTextCursor(self._text_edit.document())
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text, self._stderr_fmt)
+        cursor.setPosition(self._stderr_marker_pos)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertText(self._stderr_text, self._stderr_fmt)
+
         scrollbar = self._text_edit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
     def remove_stderr_region(self):
         """Remove the stderr block from the end of the document."""
-        self._stderr_buffer = ""
+        self._stderr_text = ""
         self._stderr_flush_timer.stop()
         if self._stderr_marker_pos is None:
             return
@@ -1190,8 +1201,8 @@ class MessageLogPanel(QWidget):
     def clear(self):
         """Clear all messages from the log."""
         self._text_edit.clear()
+        self._stderr_text = ""
         self._stderr_marker_pos = None
-        self._stderr_buffer = ""
         self._stderr_flush_timer.stop()
 
     def scroll_to_bottom(self):
