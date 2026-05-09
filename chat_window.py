@@ -976,6 +976,7 @@ class SidebarPanel(QWidget):
         self._list = QListWidget()
         self._list.itemClicked.connect(self._on_item_clicked)
         self._list.setWordWrap(True)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self._list)
 
         self._new_btn = QPushButton("+ New Conversation")
