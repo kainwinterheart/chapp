@@ -1351,6 +1351,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         # Two-level QSplitter layout with visible separators as splitter children
         sep_vertical = QFrame()
         sep_vertical.setFrameShape(QFrame.Shape.HLine)
+        sep_vertical.setFrameShadow(QFrame.Shadow.Sunken)
         sep_vertical.setFixedHeight(1)
         sep_vertical.setStyleSheet("background-color: #313244;")
         sep_vertical.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
@@ -1376,6 +1377,7 @@ class ChatWindow(QWidget, _FramelessMixin):
 
         sep_horizontal = QFrame()
         sep_horizontal.setFrameShape(QFrame.Shape.VLine)
+        sep_horizontal.setFrameShadow(QFrame.Shadow.Sunken)
         sep_horizontal.setFixedWidth(1)
         sep_horizontal.setStyleSheet("background-color: #313244;")
         sep_horizontal.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
