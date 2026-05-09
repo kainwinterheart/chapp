@@ -2,6 +2,7 @@
 
 import re
 
+from markdown_it import MarkdownIt
 from PyQt6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QKeyEvent, QMouseEvent, QPainter, QFont, QPalette, QPen, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
@@ -123,6 +124,68 @@ QLabel {
 # ── Title bar button states ──────────────────────────────────────────────
 
 _TITLE_BAR_NORMAL, _TITLE_BAR_HOVER, _TITLE_BAR_PRESSED = 0, 1, 2
+_md = MarkdownIt("gfm-like2")
+_md.disable("autolink")
+_md.disable("linkify")
+
+
+def _escape_for_markdown(s: str) -> str:
+    """Escape < and > for HTML safety while preserving markdown code spans.
+
+    Backtick-delimited code spans (`...`) are protected so their contents
+    aren't mangled by the escaping step.
+    """
+    parts: list[str] = []
+    saved: list[str] = []
+    i = 0
+    buf: list[str] = []
+
+    while i < len(s):
+        if s[i] == "`":
+            # Flush accumulated text
+            parts.append("".join(buf))
+            buf = []
+            # Count consecutive backticks
+            j = i
+            while j < len(s) and s[j] == "`":
+                j += 1
+            num_ticks = j - i
+            # Find matching closing backticks
+            k = j
+            while k < len(s):
+                if s[k] == "`":
+                    m = k
+                    while m < len(s) and s[m] == "`":
+                        m += 1
+                    if m - k == num_ticks:
+                        # Found match — save the code span
+                        saved.append(s[i:m])
+                        parts.append(f"\x00{len(saved) - 1}\x00")
+                        k = m
+                        break
+                    else:
+                        k = m
+                else:
+                    k += 1
+            else:
+                # No match — treat as literal backticks
+                buf.append("`" * num_ticks)
+                i = j
+                continue
+            i = k
+        else:
+            buf.append(s[i])
+            i += 1
+    parts.append("".join(buf))
+
+    # Join and escape < > (not &, so markdown entities render correctly)
+    escaped = "".join(parts).replace("<", "&lt;").replace(">", "&gt;")
+
+    # Restore saved code spans
+    for idx, code in enumerate(saved):
+        escaped = escaped.replace(f"\x00{idx}\x00", code)
+
+    return escaped
 
 
 # ── Frameless-window mixin (shared shadow + resize borders) ──────────────
@@ -655,6 +718,7 @@ class _UnifiedTitleBar(QWidget):
     """
 
     settings_requested = pyqtSignal()
+    markdown_toggled = pyqtSignal(bool)
 
     def __init__(self, parent, buttons=None, title="Chapp",
                  on_double_click='maximize', has_context_menu=False,
@@ -679,11 +743,20 @@ class _UnifiedTitleBar(QWidget):
 
         # ── Context menu (main window only) ─────────────────────────────
         self._context_menu = None
+        self._markdown_action = None
         if has_context_menu:
             self._context_menu = QMenu(self)
             self._settings_action = QAction("Settings", self)
             self._settings_action.triggered.connect(self.settings_requested.emit)
             self._context_menu.addAction(self._settings_action)
+
+            from settings import read_markdown_enabled
+            enabled = read_markdown_enabled()
+            self._markdown_action = QAction("Markdown Rendering", self)
+            self._markdown_action.setCheckable(True)
+            self._context_menu.addAction(self._markdown_action)
+            self._markdown_action.setChecked(enabled)
+            self._markdown_action.toggled.connect(self.markdown_toggled)
 
         # ── Layout ──────────────────────────────────────────────────────
         btn_layout = QHBoxLayout()
@@ -975,6 +1048,40 @@ class MessageLogPanel(QWidget):
         self._stderr_fmt.setFontPointSize(float(self._font_sizes.get("stderr", 8)))
         self._stderr_fmt.setForeground(QColor("#f38ba8"))
 
+        # Markdown element styles for the message log
+        self._md_stylesheet = """
+            h1 { font-size: 1.4em; font-weight: bold; margin-top: 0.5em; margin-bottom: 0.3em; }
+            h2 { font-size: 1.25em; font-weight: bold; margin-top: 0.5em; margin-bottom: 0.3em; }
+            h3 { font-size: 1.1em; font-weight: bold; margin-top: 0.4em; margin-bottom: 0.2em; }
+            p { margin: 0.3em 0; }
+            ul, ol { margin: 0.3em 0; padding-left: 1.5em; }
+            li { margin: 0.15em 0; }
+            code {
+                background-color: #313244;
+                padding: 1px 4px;
+                border-radius: 3px;
+            }
+            pre {
+                background-color: #11111b;
+                padding: 8px;
+                border-radius: 4px;
+                margin: 0.4em 0;
+            }
+            pre code {
+                background-color: transparent;
+                padding: 0;
+            }
+            blockquote {
+                border-left: 3px solid #89b4fa;
+                margin: 0.4em 0;
+                padding-left: 0.8em;
+            }
+            table { border-collapse: collapse; margin: 0.4em 0; }
+            th, td { border: 1px solid #313244; padding: 4px 8px; text-align: left; }
+            th { background-color: #313244; }
+        """
+        self._text_edit.setStyleSheet(self._md_stylesheet)
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._text_edit)
@@ -985,25 +1092,54 @@ class MessageLogPanel(QWidget):
         self._font_sizes = font_sizes
         self._stderr_fmt.setFontPointSize(float(font_sizes.get("stderr", 8)))
 
-    def append_message(self, role: str, content: str):
+    def append_message(self, role: str, content: str, markdown_enabled: bool = True):
         """Append a styled message block to the log."""
         cursor = self._text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
         if role == "user":
-            escaped = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            html = (
-                f'<table style="width:auto;border-collapse:collapse;margin:2px 0;" align="right">'
-                f'<tr><td style="background-color:#313244;padding:6px 12px;">'
-                f'<font color="#a6e3a1">{escaped.replace(chr(10), "<br>")}</font>'
-                f'</td></tr></table>'
-            )
-            cursor.insertHtml(html)
+            if markdown_enabled:
+                trimmed = content.rstrip()
+                escaped = _escape_for_markdown(trimmed)
+                rendered = _md.render(escaped).rstrip("\n")
+                wrapper = (
+                    f'<table style="width:auto;border-collapse:collapse;margin:2px 0;" align="right">'
+                    f'<tr><td style="background-color:#313244;padding:6px 12px;color:#a6e3a1;">'
+                    f'{rendered}'
+                    f'</td></tr></table>'
+                )
+                cursor.insertHtml(wrapper)
+            else:
+                escaped = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                html_plain = (
+                    f'<table style="width:auto;border-collapse:collapse;margin:2px 0;" align="right">'
+                    f'<tr><td style="background-color:#313244;padding:6px 12px;">'
+                    f'<font color="#a6e3a1">{escaped.replace(chr(10), "<br>")}</font>'
+                    f'</td></tr></table>'
+                )
+                cursor.insertHtml(html_plain)
+        elif role == "assistant":
+            if markdown_enabled:
+                trimmed = content.rstrip()
+                escaped = _escape_for_markdown(trimmed)
+                rendered = _md.render(escaped).rstrip("\n")
+                wrapper = (
+                    f'<table style="width:auto;border-collapse:collapse;margin:2px 0;" align="left">'
+                    f'<tr><td style="padding:6px 12px;color:#89b4fa;">'
+                    f'{rendered}'
+                    f'</td></tr></table>'
+                )
+                cursor.insertHtml(wrapper)
+            else:
+                fmt = self._format_for_role(role)
+                cursor.insertText(content, fmt)
         else:
+            # error role — render as plain text (not markdown)
             fmt = self._format_for_role(role)
             cursor.insertText(content, fmt)
 
-        cursor.insertBlock()
+        if not markdown_enabled:
+            cursor.insertBlock()
         cursor.insertBlock()
 
         self._text_edit.setTextCursor(cursor)
@@ -1076,6 +1212,25 @@ class InputBar(QWidget):
 
         self._text_edit = QTextEdit()
         self._text_edit.setPlaceholderText("Type your message...")
+        self._text_edit.setAcceptRichText(False)
+        # Plain text only — no markdown styling
+        self._text_edit.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e2e;
+                color: #cdd6f4;
+                border: none;
+                padding: 4px;
+                font-family: monospace;
+                font-size: 13px;
+            }
+            QTextEdit:disabled {
+                background-color: #11111b;
+                color: #585b70;
+                border: 1px solid #313244;
+                border-radius: 4px;
+                padding: 4px;
+            }
+        """)
 
         layout = QHBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1146,6 +1301,9 @@ class ChatWindow(QWidget, _FramelessMixin):
             font_size=self._font_sizes.get("title_bar", 12),
         )
         self.custom_title_bar.settings_requested.connect(self._open_settings)
+        from settings import read_markdown_enabled, save_markdown_enabled
+        self._markdown_enabled = read_markdown_enabled()
+        self.custom_title_bar.markdown_toggled.connect(self._on_markdown_toggled)
         self.custom_title_bar.setParent(self)
         self.custom_title_bar.raise_()
 
@@ -1328,7 +1486,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         session_id = self.persistence.get_active_session_id(conversation_id)
         if not is_new:
             self.persistence.add_message(conversation_id, "user", text)
-        self.message_log.append_message("user", text)
+        self.message_log.append_message("user", text, self._markdown_enabled)
         self.message_log.scroll_to_bottom()
 
         self.message_log.create_stderr_region()
@@ -1339,7 +1497,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         """Handle subprocess completion: append assistant message, save session."""
         self.subprocess_mgr.stop()
         self.message_log.remove_stderr_region()
-        self.message_log.append_message("assistant", stdout)
+        self.message_log.append_message("assistant", stdout, self._markdown_enabled)
         self.message_log.scroll_to_bottom()
 
         conversation_id = self.persistence.get_active_conversation_id()
@@ -1370,7 +1528,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
-            self.message_log.append_message(role, content)
+            self.message_log.append_message(role, content, self._markdown_enabled)
         self.message_log.scroll_to_bottom()
 
     def reset_active_state(self):
@@ -1392,3 +1550,13 @@ class ChatWindow(QWidget, _FramelessMixin):
         dlg = SettingsDialog(self)
         dlg.fonts_changed.connect(lambda: self._apply_font_sizes(dlg.get_font_sizes()))
         dlg.exec()
+
+    def _on_markdown_toggled(self, checked: bool):
+        """Handle markdown rendering toggle from context menu."""
+        from settings import save_markdown_enabled
+        save_markdown_enabled(checked)
+        self._markdown_enabled = checked
+        # Reload current conversation to re-render messages
+        conv_id = self.persistence.get_active_conversation_id()
+        if conv_id:
+            self._load_conversation_messages(conv_id)

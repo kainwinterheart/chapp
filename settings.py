@@ -41,3 +41,16 @@ def save_settings(data: dict) -> None:
     os.makedirs(_SETTINGS_DIR, exist_ok=True)
     with open(_SETTINGS_FILE, "w") as f:
         json.dump(data, f)
+
+
+def read_markdown_enabled() -> bool:
+    """Read markdown rendering setting from settings."""
+    settings = read_settings()
+    return settings.get("markdown_enabled", True)
+
+
+def save_markdown_enabled(enabled: bool) -> None:
+    """Persist markdown rendering toggle to settings."""
+    settings = read_settings()
+    settings["markdown_enabled"] = enabled
+    save_settings(settings)

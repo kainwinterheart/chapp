@@ -1,3 +1,7 @@
+linkify-it-py==2.1.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
 PyQt6==6.11.0
 PyQt6-Qt6==6.11.0
 PyQt6_sip==13.11.1
+uc-micro-py==2.0.0
