@@ -609,6 +609,25 @@ class SettingsDialog(QDialog, _FramelessMixin):
         self._styled_buttons.append(browse_btn)
         layout.addLayout(path_row)
 
+        # ── Working directory section ───────────────────────────────────
+        cwd_header = QLabel("Working directory")
+        layout.addWidget(cwd_header)
+        self._styled_labels.append(cwd_header)
+
+        self._cwd_path = _read_settings().get("working_directory", "")
+        cwd_row = QHBoxLayout()
+        self._cwd_edit = QTextEdit()
+        self._cwd_edit.setPlainText(self._cwd_path)
+        self._cwd_edit.setMaximumHeight(40)
+        cwd_row.addWidget(self._cwd_edit, 1)
+        self._styled_inputs.append(self._cwd_edit)
+
+        cwd_browse_btn = QPushButton("Browse")
+        cwd_browse_btn.clicked.connect(self._browse_directory)
+        cwd_row.addWidget(cwd_browse_btn)
+        self._styled_buttons.append(cwd_browse_btn)
+        layout.addLayout(cwd_row)
+
         # ── Buttons ─────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -711,6 +730,11 @@ class SettingsDialog(QDialog, _FramelessMixin):
         if path:
             self._path_edit.setPlainText(path)
 
+    def _browse_directory(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Working Directory")
+        if path:
+            self._cwd_edit.setPlainText(path)
+
     def _save(self) -> None:
         settings = _read_settings()
         path = self._path_edit.toPlainText().strip()
@@ -718,6 +742,12 @@ class SettingsDialog(QDialog, _FramelessMixin):
             settings["binary_path"] = path
         else:
             settings.pop("binary_path", None)
+
+        cwd = self._cwd_edit.toPlainText().strip()
+        if cwd:
+            settings["working_directory"] = cwd
+        else:
+            settings.pop("working_directory", None)
 
         font_sizes = {}
         for row in self._font_rows:

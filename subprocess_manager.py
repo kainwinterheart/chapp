@@ -30,8 +30,18 @@ class Worker(QObject):
         prompt = self._prompt
         session_id = self._session_id
 
+        # Resolve working directory from settings
+        settings = read_settings()
+        cwd_setting = settings.get("working_directory")
+
         process = None
         try:
+            # Change to working directory before spawning, restore immediately after
+            _saved_cwd = None
+            if cwd_setting:
+                _saved_cwd = os.getcwd()
+                os.chdir(cwd_setting)
+
             with TemporaryFile(buffering=0) as prompt_file:
                 prompt_file.write(prompt.encode("utf-8"))
                 prompt_file.seek(0)
@@ -43,6 +53,13 @@ class Worker(QObject):
                     stdin=prompt_file,
                     env=os.environ,
                 )
+
+            # Restore original working directory immediately after spawn
+            if _saved_cwd is not None:
+                try:
+                    os.chdir(_saved_cwd)
+                except OSError:
+                    pass
             # prompt_file closed; Popen has duplicated the fd
 
             combined_stderr = ""
