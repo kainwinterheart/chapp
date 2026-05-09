@@ -128,6 +128,38 @@ _md = MarkdownIt("gfm-like2")
 _md.disable("autolink")
 _md.disable("linkify")
 
+# Max line length inside fenced code blocks before we break the line
+_CODE_LINE_LIMIT = 120
+
+
+def _break_long_code_lines(markdown: str) -> str:
+    """Break long lines inside fenced code blocks so they fit the display area.
+
+    PyQt6 QTextEdit doesn't support CSS word-wrap on <pre> blocks, so we
+    preprocess the markdown source to insert manual line breaks.
+    """
+    def _break_block(m: re.Match) -> str:
+        fence = m.group(1)          # opening ```…
+        inner = m.group(2)          # code content
+        closing = m.group(3)        # closing ```
+        lines = inner.split("\n")
+        broken: list[str] = []
+        for line in lines:
+            if len(line) > _CODE_LINE_LIMIT:
+                # Split at the limit, preserving the rest on the next line
+                broken.append(line[:_CODE_LINE_LIMIT])
+                remainder = line[_CODE_LINE_LIMIT:]
+                while remainder:
+                    chunk = remainder[:_CODE_LINE_LIMIT]
+                    broken.append(chunk)
+                    remainder = remainder[len(chunk):]
+            else:
+                broken.append(line)
+        return fence + "\n".join(broken) + closing
+
+    # Match fenced code blocks: ``` …optional info string… \n ... \n ```
+    return re.sub(r"^(```[^\n]*)\n(.*?)^(```\s*$)", _break_block, markdown, flags=re.MULTILINE | re.DOTALL)
+
 
 def _escape_for_markdown(s: str) -> str:
     """Escape < and > for HTML safety while preserving markdown code spans.
@@ -1102,10 +1134,12 @@ class MessageLogPanel(QWidget):
         if role == "user":
             if markdown_enabled:
                 trimmed = content.rstrip()
-                escaped = _escape_for_markdown(trimmed)
+                # Break long lines in fenced code blocks before rendering
+                processed = _break_long_code_lines(trimmed)
+                escaped = _escape_for_markdown(processed)
                 rendered = _md.render(escaped).rstrip("\n")
                 wrapper = (
-                    f'<table style="width:auto;border-collapse:collapse;margin:2px 0;" align="right">'
+                    f'<table style="width:100%;border-collapse:collapse;margin:2px 0;" align="right">'
                     f'<tr><td style="background-color:#313244;padding:6px 12px;color:#a6e3a1;">'
                     f'{rendered}'
                     f'</td></tr></table>'
@@ -1123,10 +1157,11 @@ class MessageLogPanel(QWidget):
         elif role == "assistant":
             if markdown_enabled:
                 trimmed = content.rstrip()
-                escaped = _escape_for_markdown(trimmed)
+                processed = _break_long_code_lines(trimmed)
+                escaped = _escape_for_markdown(processed)
                 rendered = _md.render(escaped).rstrip("\n")
                 wrapper = (
-                    f'<table style="width:auto;border-collapse:collapse;margin:2px 0;" align="left">'
+                    f'<table style="width:100%;border-collapse:collapse;margin:2px 0;" align="left">'
                     f'<tr><td style="padding:6px 12px;color:#89b4fa;">'
                     f'{rendered}'
                     f'</td></tr></table>'
