@@ -64,42 +64,35 @@ class Worker(QObject):
 
             combined_stderr = ""
             combined_stdout = ""
-            bad = 0
             stderr_fd = process.stderr.fileno()
+            stdout_fd = process.stdout.fileno()
+            fds = [stdout_fd, stderr_fd]
+            eof = {stdout_fd: False, stderr_fd: False}
 
             while not self._kill_requested:
-                if bad >= 100:
+                active = [fd for fd in fds if not eof[fd]]
+                if not active:
                     break
                 try:
-                    ready, _, _ = select.select([stderr_fd], [], [], 0.1)
-                    if not ready:
-                        continue
-                    chunk = os.read(stderr_fd, 65536)
-                    if not chunk:
-                        break
-                    decoded = chunk.decode("utf-8", errors="replace")
-                    self.signal_stderr_chunk.emit(decoded)
-                    combined_stderr += decoded
-                    bad = 0
-                except Exception:
-                    bad += 1
-                    if (bad % 10) == 0:
-                        time.sleep(0.1)
-
-            bad = 0
-            while not self._kill_requested:
-                if bad >= 100:
+                    ready, _, _ = select.select(active, [], [], 0.1)
+                except ValueError:
                     break
-                try:
-                    chunk = process.stdout.read(65535)
-                    if not chunk:
-                        break
-                    combined_stdout += chunk.decode("utf-8")
-                    bad = 0
-                except Exception:
-                    bad += 1
-                    if (bad % 10) == 0:
-                        time.sleep(0.1)
+                if not ready:
+                    continue
+                for fd in ready:
+                    try:
+                        chunk = os.read(fd, 65536)
+                        if not chunk:
+                            eof[fd] = True
+                            continue
+                        if fd == stderr_fd:
+                            decoded = chunk.decode("utf-8", errors="replace")
+                            self.signal_stderr_chunk.emit(decoded)
+                            combined_stderr += decoded
+                        else:
+                            combined_stdout += chunk.decode("utf-8", errors="replace")
+                    except Exception:
+                        eof[fd] = True
 
             if not self._kill_requested:
                 process.wait()
