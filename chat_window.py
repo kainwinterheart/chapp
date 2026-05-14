@@ -1249,9 +1249,6 @@ class MessageLogPanel(QWidget):
         cursor.removeSelectedText()
         cursor.insertText(self._stderr_text, self._stderr_fmt)
 
-        scrollbar = self._text_edit.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
     def remove_stderr_region(self):
         """Remove the stderr block from the end of the document."""
         self._stderr_text = ""
