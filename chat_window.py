@@ -158,7 +158,7 @@ def _break_long_code_lines(markdown: str) -> str:
         return fence + "\n".join(broken) + closing
 
     # Match fenced code blocks: ``` …optional info string… \n ... \n ```
-    return re.sub(r"^(```[^\n]*)\n(.*?)^(```\s*$)", _break_block, markdown, flags=re.MULTILINE | re.DOTALL)
+    return re.sub(r"^(```[^\n]*\n)(.*?)^(```\s*$)", _break_block, markdown, flags=re.MULTILINE | re.DOTALL)
 
 
 def _escape_for_markdown(s: str) -> str:
