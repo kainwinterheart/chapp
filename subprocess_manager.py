@@ -9,7 +9,7 @@ from typing import Optional
 
 from PyQt6.QtCore import QThread, QObject, pyqtSignal, Qt
 
-from settings import read_settings
+# subprocess parameters resolved via DataPersistenceManager
 
 
 class Worker(QObject):
@@ -23,16 +23,14 @@ class Worker(QObject):
         self._command: list[str] = []
         self._prompt: str = ""
         self._session_id: Optional[str] = None
+        self._working_directory: Optional[str] = None
         self._kill_requested = False
 
     def execute(self) -> None:
         command = self._command
         prompt = self._prompt
         session_id = self._session_id
-
-        # Resolve working directory from settings
-        settings = read_settings()
-        cwd_setting = settings.get("working_directory")
+        cwd_setting = self._working_directory
 
         process = None
         try:
@@ -151,23 +149,27 @@ class SubprocessManager(QObject):
     signal_finished = pyqtSignal()
     signal_kill_requested = pyqtSignal()
 
-    def __init__(self, schema: dict, timeout: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        schema: dict,
+        timeout: Optional[str] = None,
+        persistence=None,
+    ) -> None:
         super().__init__()
         self._schema = schema
         self._timeout = timeout
+        self._persistence = persistence
         self._running = False
         self._thread: Optional[QThread] = None
 
-    def _build_command(self, session_id: Optional[str]) -> list[str]:
+    def _build_command(
+        self, session_id: Optional[str], binary_path: Optional[str] = None
+    ) -> list[str]:
         cmd = []
         if self._timeout:
             cmd.extend(["timeout", "-s", "9", self._timeout])
         if shutil.which("stdbuf"):
             cmd.extend(["stdbuf", "-eL"])
-
-        # Read settings for custom binary path (every call to pick up changes)
-        settings = read_settings()
-        binary_path = settings.get("binary_path")
 
         if binary_path:
             cmd.extend([binary_path, "exec"])
@@ -189,16 +191,30 @@ class SubprocessManager(QObject):
         thread.wait()
         thread.deleteLater()
 
-    def submit(self, prompt: str, session_id: Optional[str] = None) -> None:
+    def submit(
+        self,
+        prompt: str,
+        session_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+    ) -> None:
         if self._running:
             self.signal_error.emit("Another subprocess is already running")
             return
 
-        command = self._build_command(session_id)
+        # Resolve subprocess parameters for this conversation
+        binary_path = None
+        working_directory = None
+        if conversation_id and self._persistence is not None:
+            resolved = self._persistence.resolve_subprocess_parameters(conversation_id)
+            binary_path = resolved.get("binary_path")
+            working_directory = resolved.get("working_directory")
+
+        command = self._build_command(session_id, binary_path)
         worker = Worker()
         worker._command = command
         worker._prompt = prompt
         worker._session_id = session_id
+        worker._working_directory = working_directory
 
         thread = QThread()
 

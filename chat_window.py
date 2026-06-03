@@ -1019,13 +1019,147 @@ class MaximizeButton(_TitleBarButton):
             painter.drawLine(o + 2, o + 2, o + s, o + 2)
 
 
-# ── SidebarPanel ─────────────────────────────────────────────────────────
+
+# ── Conversation Info Modal ──────────────────────────────────────────────
+
+class ConversationInfoModal(QDialog, _FramelessMixin):
+    """Modal dialog showing conversation subprocess parameters.
+
+    Follows the SettingsDialog pattern: frameless QDialog with _FramelessMixin,
+    title bar, shadow effect, dynamic font styling. Delegates to
+    DataPersistenceManager.resolve_subprocess_parameters().
+    """
+
+    _title_bar_height = _TITLE_BAR_HEIGHT
+
+    def __init__(self, conversation_id: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setWindowTitle("Conversation Info")
+
+        self.setStyleSheet("QDialog { border: 1px solid #313244; border-radius: 8px; background-color: #1e1e2e; }")
+
+        self._apply_shadow()
+
+        self._tbar = _UnifiedTitleBar(
+            self,
+            buttons=[CloseButton(self)],
+            title="Conversation Info",
+            on_double_click='close',
+            has_context_menu=False,
+        )
+        self._tbar.setParent(self)
+        self._tbar.raise_()
+
+        # Resolve parameters from persistence via parent ChatWindow
+        self._resolved: dict = {}
+        if parent is not None:
+            persistence = getattr(parent, "persistence", None)
+            if persistence is not None:
+                self._resolved = persistence.resolve_subprocess_parameters(conversation_id)
+
+        # Read font sizes from settings
+        font_sizes = _read_font_sizes()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, _TITLE_BAR_HEIGHT + 8, 16, 16)
+        layout.setSpacing(12)
+
+        # Store references for font styling
+        self._styled_labels: list[QLabel] = []
+        self._styled_inputs: list[QWidget] = []
+
+        # ─ Session ID ──────────────────────────────────────────────────
+        sess_header = QLabel("Session ID")
+        layout.addWidget(sess_header)
+        self._styled_labels.append(sess_header)
+
+        self._session_field = QTextEdit()
+        self._session_field.setReadOnly(True)
+        session_id = self._resolved.get("session_id", "") or ""
+        self._session_field.setPlainText(session_id)
+        self._session_field.setMaximumHeight(32)
+        layout.addWidget(self._session_field)
+        self._styled_inputs.append(self._session_field)
+
+
+        # ─ Binary Path ───────────────────────────────────────────────────
+        bp_header = QLabel("Binary Path")
+        layout.addWidget(bp_header)
+        self._styled_labels.append(bp_header)
+
+        self._binary_field = QTextEdit()
+        self._binary_field.setReadOnly(True)
+        binary_path = self._resolved.get("binary_path", "") or ""
+        self._binary_field.setPlainText(binary_path)
+        self._binary_field.setMaximumHeight(32)
+        layout.addWidget(self._binary_field)
+        self._styled_inputs.append(self._binary_field)
+
+        # ─ Working Directory ─────────────────────────────────────────────────
+        wd_header = QLabel("Working Directory")
+        layout.addWidget(wd_header)
+        self._styled_labels.append(wd_header)
+
+        self._cwd_field = QTextEdit()
+        self._cwd_field.setReadOnly(True)
+        working_directory = self._resolved.get("working_directory", "") or ""
+        self._cwd_field.setPlainText(working_directory)
+        self._cwd_field.setMaximumHeight(32)
+        layout.addWidget(self._cwd_field)
+        self._styled_inputs.append(self._cwd_field)
+
+        # Apply font sizes to all widgets
+        self._apply_dialog_fonts(font_sizes)
+        self._resize_title_bar()
+
+        # Finalize size now that layout is fully built
+        self.adjustSize()
+        self.setMinimumSize(480, self.height())
+
+    def _resize_title_bar(self) -> None:
+        if hasattr(self, "_tbar"):
+            self._tbar.resize(self.width(), _TITLE_BAR_HEIGHT)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._resize_title_bar()
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if _handle_frameless_event(self, obj, event):
+            return True
+        return super().eventFilter(obj, event)  # type: ignore[misc]
+
+    def _apply_dialog_fonts(self, font_sizes: dict) -> None:
+        """Apply stored font sizes to all dialog widgets."""
+        label_size = font_sizes.get("settings_label", 13)
+        input_size = font_sizes.get("settings_input", 13)
+
+        for lbl in self._styled_labels:
+            lbl.setStyleSheet(f"color: #a6adc8; font-size: {label_size}px;")
+        for inp in self._styled_inputs:
+            inp.setStyleSheet("""
+                QTextEdit {
+                    background-color: #1e1e2e;
+                    color: #cdd6f4;
+                    border: 1px solid #313244;
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                    font-family: monospace;
+                    font-size: %(input_size)spx;
+                }
+            """ % {"input_size": input_size})
+
 
 class SidebarPanel(QWidget):
     """Left panel displaying the conversation list."""
 
     conversation_clicked = pyqtSignal(str)
     new_conversation_requested = pyqtSignal()
+    conversation_context_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1037,8 +1171,11 @@ class SidebarPanel(QWidget):
 
         self._list = QListWidget()
         self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.setMouseTracking(True)
         self._list.setWordWrap(True)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Install event filter on the list widget to intercept right-clicks
+        self._list.viewport().installEventFilter(self)
         scroll.setWidget(self._list)
 
         self._new_btn = QPushButton("+ New Conversation")
@@ -1050,6 +1187,21 @@ class SidebarPanel(QWidget):
         layout.addWidget(self._new_btn)
 
         self.setLayout(layout)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        """Intercept right-click on the list widget to emit conversation_context_requested."""
+        if obj is self._list.viewport() and event.type() == QEvent.Type.MouseButtonPress:
+            me = event  # type: ignore[assignment]
+            if hasattr(me, "button") and me.button() == Qt.MouseButton.RightButton:
+                # Get position relative to the list widget
+                pos = me.pos() if hasattr(me, "pos") else QPoint(0, 0)
+                item = self._list.itemAt(pos)
+                if item is not None:
+                    conv_id = item.data(Qt.ItemDataRole.UserRole)
+                    if conv_id is not None:
+                        self.conversation_context_requested.emit(conv_id)
+                        return True
+        return super().eventFilter(obj, event)
 
     def _on_item_clicked(self, item: QListWidgetItem):
         conv_id = item.data(Qt.ItemDataRole.UserRole)
@@ -1393,7 +1545,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         self.persistence = DataPersistenceManager()
         self.persistence.load_all()
 
-        self.subprocess_mgr = SubprocessManager(schema, timeout)
+        self.subprocess_mgr = SubprocessManager(schema, timeout, persistence=self.persistence)
 
         self.sidebar = SidebarPanel()
         self.message_log = MessageLogPanel(font_sizes=self._font_sizes)
@@ -1410,6 +1562,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         # Wire sidebar click
         self.sidebar.conversation_clicked.connect(self.on_conversation_selected)
         self.sidebar.new_conversation_requested.connect(self.reset_active_state)
+        self.sidebar.conversation_context_requested.connect(self._on_conversation_context_requested)
 
         # Wire input submit
         self.input_bar.submitted.connect(self.on_submit)
@@ -1569,7 +1722,7 @@ class ChatWindow(QWidget, _FramelessMixin):
         self.message_log.scroll_to_bottom()
 
         self.message_log.create_stderr_region()
-        self.subprocess_mgr.submit(text, session_id)
+        self.subprocess_mgr.submit(text, session_id, conversation_id=conversation_id)
         self.input_bar.set_enabled(False)
 
     def on_completed(self, stdout: str, session_id):
@@ -1623,6 +1776,11 @@ class ChatWindow(QWidget, _FramelessMixin):
         self.persistence.activate_conversation(conversation_id)
         self._load_conversation_messages(conversation_id)
         self.sidebar.set_active_conversation(conversation_id)
+
+    def _on_conversation_context_requested(self, conversation_id: str):
+        """Open the conversation info modal on right-click."""
+        dlg = ConversationInfoModal(conversation_id, self)
+        dlg.exec()
 
     def _open_settings(self):
         """Open the settings modal dialog."""

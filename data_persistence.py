@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from settings import _SETTINGS_DIR
+from settings import _SETTINGS_DIR, read_settings
 
 
 class DataPersistenceManager:
@@ -135,12 +135,15 @@ class DataPersistenceManager:
     ) -> None:
         """Create a new conversation and persist it to disk."""
         now = time.time()
+        settings = read_settings()
         conv_data: dict = {
             "id": conversation_id,
             "session_id": session_id,
             "messages": [],
             "created_at": now,
             "updated_at": now,
+            "binary_path": settings.get("binary_path"),
+            "working_directory": settings.get("working_directory"),
         }
         self._index.insert(0, {"id": conversation_id, "timestamp": now})
         self._conversations[conversation_id] = conv_data
@@ -159,6 +162,7 @@ class DataPersistenceManager:
     ) -> None:
         """Create a new conversation with an initial message in a single write."""
         now = time.time()
+        settings = read_settings()
         message: dict = {"role": role, "content": content}
         conv_data: dict = {
             "id": conversation_id,
@@ -166,6 +170,8 @@ class DataPersistenceManager:
             "messages": [message],
             "created_at": now,
             "updated_at": now,
+            "binary_path": settings.get("binary_path"),
+            "working_directory": settings.get("working_directory"),
         }
         self._index.insert(0, {"id": conversation_id, "timestamp": now})
         self._conversations[conversation_id] = conv_data
@@ -211,6 +217,45 @@ class DataPersistenceManager:
         self._atomic_write(
             self._conversation_path(conversation_id), conv
         )
+
+    def resolve_subprocess_parameters(
+        self, conversation_id: str
+    ) -> dict:
+        """Resolve subprocess parameters for a conversation.
+
+        For each parameter independently: use the persisted conversation
+        value if present, otherwise fall back to live settings.
+        Also returns session_id from the conversation record.
+        """
+        settings = read_settings()
+        conv = self._conversations.get(conversation_id)
+        if conv is None:
+            return {
+                "session_id": None,
+                "binary_path": settings.get("binary_path"),
+                "working_directory": settings.get("working_directory"),
+            }
+
+        resolved: dict = {}
+
+        # Include session_id from the conversation record
+        resolved["session_id"] = conv.get("session_id")
+
+        # Resolve binary_path: persisted value first, live settings second
+        persisted_bp = conv.get("binary_path")
+        if persisted_bp is not None:
+            resolved["binary_path"] = persisted_bp
+        else:
+            resolved["binary_path"] = settings.get("binary_path")
+
+        # Resolve working_directory: persisted value first, live settings second
+        persisted_wd = conv.get("working_directory")
+        if persisted_wd is not None:
+            resolved["working_directory"] = persisted_wd
+        else:
+            resolved["working_directory"] = settings.get("working_directory")
+
+        return resolved
 
     def get_conversations(self) -> list[dict]:
         """Return a list of conversation summaries ordered newest-first.
