@@ -304,6 +304,10 @@ class DataPersistenceManager:
         self._ensure_dir()
         self._atomic_write(self._index_path(), self._index)
 
+    def clear_active_conversation(self) -> None:
+        """Clear the active conversation without activating a new one."""
+        self._active_conversation_id = None
+
     def get_active_conversation_id(self) -> Optional[str]:
         """Return the currently active conversation ID."""
         return self._active_conversation_id

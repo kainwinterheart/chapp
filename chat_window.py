@@ -1,10 +1,13 @@
 """Chat window UI with sidebar, message log, and input bar."""
 
 import re
+from dataclasses import dataclass, field
 
+
+from PyQt6.QtGui import QTextDocument
 from markdown_it import MarkdownIt
 from PyQt6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QKeyEvent, QMouseEvent, QPainter, QFont, QPalette, QPen, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QAction, QCloseEvent, QColor, QKeyEvent, QMouseEvent, QPainter, QFont, QPalette, QPen, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QDialog,
     QApplication,
@@ -35,6 +38,16 @@ from settings import (
     save_settings as _save_settings,
 )
 from subprocess_manager import SubprocessManager
+
+
+@dataclass
+class SubprocessOutputBuffer:
+    """Stores stdout, stderr_chunks, error, and lifecycle flags for departing conversations."""
+    stderr_chunks: str = ""
+    stdout: str = ""
+    error: str | None = None
+    completed: bool = False
+    errored: bool = False
 
 # ── Shared constants ───────────────────────────────────────────────────────
 
@@ -312,8 +325,11 @@ def _handle_frameless_event(
             and event.key() == Qt.Key.Key_C
             and event.modifiers() == Qt.KeyboardModifier.ControlModifier):
         mgr = getattr(self_obj, "subprocess_mgr", None)
-        if mgr and mgr.is_running():
-            mgr.signal_kill_requested.emit()
+        pers = getattr(self_obj, "persistence", None)
+        if mgr and mgr.is_running() and pers:
+            active_cid = pers.get_active_conversation_id()
+            if active_cid:
+                mgr.stop(active_cid)
             return True
 
     # --- Resize-border handling ---
@@ -1242,8 +1258,6 @@ class SidebarPanel(QWidget):
 
 
 class MessageLogPanel(QWidget):
-    """Center panel displaying message history with optional stderr overlay."""
-
     def __init__(self, parent=None, font_sizes: dict | None = None):
         super().__init__(parent)
         self._font_sizes = font_sizes or {}
@@ -1251,6 +1265,15 @@ class MessageLogPanel(QWidget):
         self._text_edit = QTextEdit()
         self._text_edit.setReadOnly(True)
         self._stderr_marker_pos = None
+
+        # Per-conversation storage
+        self._raw_messages: dict[str, list] = {}
+        self._stderr_buffers: dict[str, str] = {}
+        self._marker_positions: dict[str, int] = {}
+        self._active_flush_cid: str | None = None
+
+        # Track message start offsets for safe flush capping
+        self._message_start_offsets: dict[str, int] = {}
 
         # Stderr line buffer (keeps last 50 lines)
         self._stderr_text = ""
@@ -1308,15 +1331,19 @@ class MessageLogPanel(QWidget):
         self._font_sizes = font_sizes
         self._stderr_fmt.setFontPointSize(float(font_sizes.get("stderr", 8)))
 
-    def append_message(self, role: str, content: str, markdown_enabled: bool = True):
-        """Append a styled message block to the log."""
+    def append_message(self, cid: str, role: str, content: str, markdown_enabled: bool = True):
+        """Append a message, storing raw data and rendering."""
+        self._raw_messages.setdefault(cid, []).append((role, content))
+        self._render_message(cid, role, content, markdown_enabled)
+
+    def _render_message(self, cid: str, role: str, content: str, markdown_enabled: bool):
+        """Render a single message block to the shared widget (no storage)."""
         cursor = self._text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
         if role == "user":
             if markdown_enabled:
                 trimmed = content.rstrip()
-                # Break long lines in fenced code blocks before rendering
                 processed = _break_long_code_lines(trimmed)
                 escaped = _escape_for_markdown(processed)
                 rendered = _md.render(escaped).rstrip("\n")
@@ -1353,7 +1380,6 @@ class MessageLogPanel(QWidget):
                 fmt = self._format_for_role(role)
                 cursor.insertText(content, fmt)
         else:
-            # error role — render as plain text (not markdown)
             fmt = self._format_for_role(role)
             cursor.insertText(content, fmt)
 
@@ -1371,57 +1397,103 @@ class MessageLogPanel(QWidget):
             fmt.setForeground(QColor("#89b4fa"))
         return fmt
 
-    def create_stderr_region(self):
+    def create_stderr_region(self, cid: str):
         """Mark the document position where stderr content will begin."""
         cursor = self._text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertBlock()
-        self._stderr_marker_pos = cursor.position()
+        self._marker_positions[cid] = cursor.position()
 
-    def append_stderr_chunk(self, chunk: str):
-        """Append chunk to internal line buffer."""
-        self._stderr_text += chunk
+    def append_stderr_chunk(self, cid: str, chunk: str):
+        """Append chunk to per-conversation stderr buffer."""
+        buffer = self._stderr_buffers.get(cid, '') + chunk
+        self._stderr_buffers[cid] = buffer
         self._stderr_flush_timer.start()
 
     def _flush_stderr_buffer(self):
-        """Truncate buffer to last N lines, then replace stderr region."""
-        if not self._stderr_text:
+        """Flush the active conversation's stderr buffer to the widget."""
+        if self._active_flush_cid is None:
             return
-        if self._stderr_marker_pos is None:
+        buffer = self._stderr_buffers.get(self._active_flush_cid, '')
+        if not buffer:
+            return
+        marker = self._marker_positions.get(self._active_flush_cid)
+        if marker is None:
             return
 
         # Truncate to last MAX_STDERR_LINES
-        lines = self._stderr_text.splitlines(keepends=True)
-        if len(lines) > self._MAX_STDERR_LINES:
-            self._stderr_text = "".join(lines[-self._MAX_STDERR_LINES:])
+        lines_buf = buffer.splitlines(keepends=True)
+        if len(lines_buf) > self._MAX_STDERR_LINES:
+            self._stderr_buffers[self._active_flush_cid] = "".join(lines_buf[-self._MAX_STDERR_LINES:])
+            buffer = self._stderr_buffers[self._active_flush_cid]
 
         cursor = QTextCursor(self._text_edit.document())
-        cursor.setPosition(self._stderr_marker_pos)
+        cursor.setPosition(marker)
         cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        # Cap selection at message boundary to avoid eating appended messages
+        msg_start = self._message_start_offsets.get(self._active_flush_cid)
+        if msg_start is not None:
+            # Reset anchor at msg_start, then reposition at marker to select [marker→msg_start]
+            cursor.setPosition(msg_start, QTextCursor.MoveMode.MoveAnchor)
+            cursor.setPosition(marker, QTextCursor.MoveMode.KeepAnchor)
         cursor.removeSelectedText()
-        cursor.insertText(self._stderr_text, self._stderr_fmt)
+        cursor.insertText(buffer, self._stderr_fmt)
+        self.scroll_to_bottom()
 
-        scrollbar = self._text_edit.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def remove_stderr_region(self):
-        """Remove the stderr block from the end of the document."""
-        self._stderr_text = ""
+    def remove_stderr_region(self, cid: str, doc, active_cid: str | None = None):
+        """Remove the stderr block for a specific conversation."""
         self._stderr_flush_timer.stop()
-        if self._stderr_marker_pos is None:
-            return
-        cursor = QTextCursor(self._text_edit.document())
-        cursor.setPosition(self._stderr_marker_pos)
-        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
-        cursor.removeSelectedText()
-        self._stderr_marker_pos = None
+        self._stderr_buffers.pop(cid, None)
+        self._message_start_offsets.pop(cid, None)
+        marker = self._marker_positions.pop(cid, None)
+        if marker is not None:
+            cursor = QTextCursor(doc)
+            cursor.setPosition(marker)
+            cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+        if self._active_flush_cid == cid:
+            self._active_flush_cid = None
 
-    def clear(self):
-        """Clear all messages from the log."""
+    def _full_clear(self):
+        """Clear all per-conversation data and the shared widget."""
+        for cid in list(self._raw_messages.keys()):
+            self._raw_messages[cid] = []
+        for cid in list(self._stderr_buffers.keys()):
+            self._stderr_buffers[cid] = ''
+        for cid in list(self._marker_positions.keys()):
+            self._marker_positions[cid] = None
+        self._message_start_offsets.clear()
         self._text_edit.clear()
-        self._stderr_text = ""
-        self._stderr_marker_pos = None
+        self._active_flush_cid = None
         self._stderr_flush_timer.stop()
+
+
+    def clear_conversation_data(self, cid: str):
+        """Clear per-conversation message, stderr, and marker data for *cid*.
+
+        Safe to call when cid is not present (dict.pop(cid, None)).
+        Resets _active_flush_cid to None when the cleared conversation
+        is the active flush target — documented safe due to
+        _flush_stderr_buffer early-return on None.
+        """
+        self._stderr_buffers.pop(cid, None)
+        self._message_start_offsets.pop(cid, None)
+        self._marker_positions.pop(cid, None)
+        if self._active_flush_cid == cid:
+            self._active_flush_cid = None
+
+    def render_from_cache(self, cid: str, markdown_enabled: bool = True, preserve_content: bool = False):
+        """Re-render all cached messages for *cid* without calling append_message.
+
+        When *preserve_content* is True, the document is not cleared so that
+        user messages submitted while a subprocess is running are retained.
+        """
+        if not preserve_content:
+            self._text_edit.clear()
+        for role, content in self._raw_messages.get(cid, []):
+            self._render_message(cid, role, content, markdown_enabled)
+        self.create_stderr_region(cid)
+        self.scroll_to_bottom()
 
     def scroll_to_bottom(self):
         """Scroll the view to the bottom."""
@@ -1483,6 +1555,111 @@ class InputBar(QWidget):
 
     def set_enabled(self, enabled: bool):
         self._text_edit.setEnabled(enabled)
+
+
+
+# ── InputBarStateDelegate ──────────────────────────────────────────────
+
+class InputBarStateDelegate:
+    """Manages per-conversation enabled/running state for InputBar.
+
+    Owned by ChatWindow; applies widget state based on the active
+    conversation queried from persistence (not the notified conversation).
+    """
+
+    def __init__(self, subprocess_mgr, persistence, input_bar):
+        self._subprocess_mgr = subprocess_mgr
+        self._persistence = persistence
+        self._input_bar = input_bar
+        self._enabled_states: dict[str, bool] = {}
+        self._running_states: dict[str, bool] = {}
+
+    def has_running_subprocess(self, cid: str) -> bool:
+        return self._running_states.get(cid, False)
+
+    def get_enabled_state(self, cid: str) -> bool:
+        return self._enabled_states.get(cid, True)
+
+    def on_lifecycle_notification(self, cid: str, event: str) -> None:
+        """Process a lifecycle notification for *cid*."""
+        # Late-notification guard: cid must still exist in subprocess manager
+        if not self._subprocess_mgr.has_conversation(cid):
+            return
+
+        if event == 'start':
+            self._running_states[cid] = True
+            self._enabled_states[cid] = False
+        elif event in ('complete', 'error'):
+            self._running_states[cid] = False
+            self._enabled_states[cid] = True
+
+        # Apply widget state for the VISIBLE (active) conversation only
+        active_cid = self._persistence.get_active_conversation_id()
+        if active_cid:
+            self._input_bar.set_enabled(self.get_enabled_state(active_cid))
+
+    def apply_state_to_widget(self, cid: str) -> None:
+        """Pure read-only: apply the delegate's stored enabled state for *cid* to the widget.
+
+        Does NOT mutate _running_states or _enabled_states.  Used when switching
+        conversations to reconcile widget state without triggering lifecycle side effects.
+        """
+        self._input_bar.set_enabled(self.get_enabled_state(cid))
+
+
+class ConversationSignalBinding:
+    """Encapsulates signal-to-handler connections for a single conversation.
+
+    Filters signals by conversation_id so that only signals belonging to this
+    conversation reach the handler methods.  Uses regular methods (not lambdas)
+    as intermediaries to avoid Python closure variable binding issues.
+    """
+
+    def __init__(self, cid, subprocess_mgr, stderr_handler, completed_handler, error_handler):
+        self.cid = cid
+        self._subprocess_mgr = subprocess_mgr
+        self._stderr_handler = stderr_handler
+        self._completed_handler = completed_handler
+        self._error_handler = error_handler
+
+    def connect(self):
+        """Establish signal connections routed through internal filter methods."""
+        self._subprocess_mgr.signal_stderr_chunk.connect(
+            self._on_stderr_chunk, Qt.ConnectionType.QueuedConnection
+        )
+        self._subprocess_mgr.signal_completed.connect(
+            self._on_completed, Qt.ConnectionType.QueuedConnection
+        )
+        self._subprocess_mgr.signal_error.connect(
+            self._on_error, Qt.ConnectionType.QueuedConnection
+        )
+
+    def _on_stderr_chunk(self, cid, chunk):
+        if cid == self.cid:
+            self._stderr_handler(cid, chunk)
+
+    def _on_completed(self, cid, stdout, session_id):
+        if cid == self.cid:
+            self._completed_handler(cid, stdout, session_id)
+
+    def _on_error(self, cid, msg):
+        if cid == self.cid:
+            self._error_handler(cid, msg)
+
+    def disconnect(self):
+        """Sever all signal connections, catching RuntimeError for already-disconnected signals."""
+        try:
+            self._subprocess_mgr.signal_stderr_chunk.disconnect(self._on_stderr_chunk)
+        except RuntimeError:
+            pass
+        try:
+            self._subprocess_mgr.signal_completed.disconnect(self._on_completed)
+        except RuntimeError:
+            pass
+        try:
+            self._subprocess_mgr.signal_error.disconnect(self._on_error)
+        except RuntimeError:
+            pass
 
 
 # ── ChatWindow ───────────────────────────────────────────────────────────
@@ -1547,17 +1724,16 @@ class ChatWindow(QWidget, _FramelessMixin):
 
         self.subprocess_mgr = SubprocessManager(schema, timeout, persistence=self.persistence)
 
+        self.input_bar = InputBar()
+        self.input_bar_delegate = InputBarStateDelegate(self.subprocess_mgr, self.persistence, self.input_bar)
+        # Startup orphan detection pattern: at init, _conversations is empty so
+        # detect_orphaned_subprocesses would return [].  Runtime wirepoint is in
+        # closeEvent only (where persistence may have stale entries from a prior run).
+
         self.sidebar = SidebarPanel()
         self.message_log = MessageLogPanel(font_sizes=self._font_sizes)
-        self.input_bar = InputBar()
-
-        # Wire subprocess signals
-        self.subprocess_mgr.signal_stderr_chunk.connect(
-            self.message_log.append_stderr_chunk
-        )
-        self.subprocess_mgr.signal_completed.connect(self.on_completed)
-        self.subprocess_mgr.signal_error.connect(self.on_error)
-        self.subprocess_mgr.signal_finished.connect(self.on_finished)
+        self._conversation_bindings: dict[str, ConversationSignalBinding] = {}
+        self._output_buffers: dict[str, SubprocessOutputBuffer] = {}
 
         # Wire sidebar click
         self.sidebar.conversation_clicked.connect(self.on_conversation_selected)
@@ -1701,7 +1877,8 @@ class ChatWindow(QWidget, _FramelessMixin):
 
     def on_submit(self, text: str):
         """Handle submit button click: send prompt to subprocess manager."""
-        if self.subprocess_mgr.is_running():
+        active_cid = self.persistence.get_active_conversation_id()
+        if active_cid and self.input_bar_delegate.has_running_subprocess(active_cid):
             return
 
         conversation_id = self.persistence.get_active_conversation_id()
@@ -1718,64 +1895,254 @@ class ChatWindow(QWidget, _FramelessMixin):
         session_id = self.persistence.get_active_session_id(conversation_id)
         if not is_new:
             self.persistence.add_message(conversation_id, "user", text)
-        self.message_log.append_message("user", text, self._markdown_enabled)
+        self.message_log.append_message(conversation_id, "user", text, self._markdown_enabled)
         self.message_log.scroll_to_bottom()
 
-        self.message_log.create_stderr_region()
-        self.subprocess_mgr.submit(text, session_id, conversation_id=conversation_id)
-        self.input_bar.set_enabled(False)
+        self.message_log.create_stderr_region(conversation_id)
+        self.message_log._active_flush_cid = conversation_id
 
-    def on_completed(self, stdout: str, session_id):
-        """Handle subprocess completion: append assistant message, save session."""
-        self.subprocess_mgr.stop()
-        self.message_log.remove_stderr_region()
-        self.message_log.append_message("assistant", stdout, self._markdown_enabled)
-        self.message_log.scroll_to_bottom()
+        # Clean up existing binding if one exists for this conversation
+        existing = self._conversation_bindings.get(conversation_id)
+        if existing is not None:
+            self._disconnect_binding(conversation_id)
 
-        conversation_id = self.persistence.get_active_conversation_id()
-        if conversation_id:
+        # Create and connect new signal binding
+        binding = ConversationSignalBinding(
+            conversation_id,
+            self.subprocess_mgr,
+            self.message_log.append_stderr_chunk,
+            self.on_completed,
+            self.on_error,
+        )
+        binding.connect()
+        self._conversation_bindings[conversation_id] = binding
+
+        # Submit with exception-safe rollback
+        try:
+            self.subprocess_mgr.submit(text, session_id, conversation_id=conversation_id)
+        except Exception:
+            self._disconnect_binding(conversation_id)
+            raise
+
+        # Note: error signals with None conversation_id (from SubprocessManager's
+        # duplicate submission guard) are intentionally filtered by all bindings' filter methods.
+
+    def _disconnect_binding(self, cid: str) -> None:
+        """Disconnect and remove the signal binding for *cid*.
+
+        Pops the binding first (ensuring removal even if disconnect fails),
+        then severs signal connections.  The binding object goes out of scope
+        and is garbage-collected.
+        """
+        binding = self._conversation_bindings.pop(cid, None)
+        if binding is not None:
+            binding.disconnect()
+
+    def on_completed(self, conversation_id, stdout: str, session_id):
+        """Handle subprocess completion with two-layer lifecycle management."""
+        active_cid = self.persistence.get_active_conversation_id()
+        is_active = conversation_id == active_cid
+
+        # ── Layer 1: Lifecycle cleanup (always executes) ──────────────────
+        self.input_bar_delegate.on_lifecycle_notification(conversation_id, 'complete')
+        self._disconnect_binding(conversation_id)
+        self.subprocess_mgr.stop(conversation_id)
+        self.message_log._stderr_flush_timer.stop()
+        # Capture stderr data before remove_stderr_region clears _stderr_buffers[cid]
+        buffer_content = self.message_log._stderr_buffers.get(conversation_id, '')
+        self.message_log.remove_stderr_region(conversation_id, self.message_log._text_edit.document(), active_cid)
+
+        # Persistence for ACTIVE conversations only (departing handled by _flush_subprocess_buffer)
+        if is_active and conversation_id:
             self.persistence.add_message(conversation_id, "assistant", stdout)
             if session_id is not None:
                 self.persistence.set_active_session_id(conversation_id, session_id)
+
+        # UI update only for ACTIVE conversation
+        if is_active and conversation_id:
+            self.message_log.append_message(conversation_id, "assistant", stdout, self._markdown_enabled)
+            self.message_log.scroll_to_bottom()
             self._refresh_sidebar()
 
-        self.input_bar.set_enabled(True)
+        # Buffer output for DEPARTING conversations
+        if not is_active and conversation_id:
+            if conversation_id not in self._output_buffers:
+                self._output_buffers[conversation_id] = SubprocessOutputBuffer()
+            self._output_buffers[conversation_id].stdout = stdout
+            self._output_buffers[conversation_id].completed = True
 
-    def on_error(self, message: str):
-        """Handle subprocess error."""
-        self.subprocess_mgr.stop()
-        self.message_log.remove_stderr_region()
-        self.message_log.append_message("error", message)
-        self.message_log.scroll_to_bottom()
-        self.input_bar.set_enabled(True)
+            # Persist immediately so the message survives even if the user
+            # never switches back.  Clear _raw_messages so reselection always
+            # reloads from persistence (avoids stale/duplicate cache entries).
+            self.persistence.add_message(conversation_id, "assistant", stdout)
+            if session_id is not None:
+                self.persistence.set_active_session_id(conversation_id, session_id)
+            self.message_log._raw_messages.pop(conversation_id, None)
 
-    def on_finished(self):
-        """Universal safety net to re-enable input."""
-        self.input_bar.set_enabled(True)
+    def on_error(self, conversation_id, message: str):
+        """Handle subprocess error with two-layer lifecycle management."""
+        active_cid = self.persistence.get_active_conversation_id()
+        is_active = conversation_id == active_cid
+
+        # ── Layer 1: Lifecycle cleanup (always executes) ──────────────────
+        self.input_bar_delegate.on_lifecycle_notification(conversation_id, 'error')
+        self._disconnect_binding(conversation_id)
+        self.subprocess_mgr.stop(conversation_id)
+        self.message_log._stderr_flush_timer.stop()
+        # Capture stderr data before remove_stderr_region clears _stderr_buffers[cid]
+        buffer_content = self.message_log._stderr_buffers.get(conversation_id, '')
+        self.message_log.remove_stderr_region(conversation_id, self.message_log._text_edit.document(), active_cid)
+
+        # Persistence for ACTIVE conversations only (departing handled by _flush_subprocess_buffer)
+        if is_active and conversation_id:
+            self.persistence.add_message(conversation_id, "error", message)
+
+        # UI update only for ACTIVE conversation
+        if is_active and conversation_id:
+            self.message_log.append_message(conversation_id, "error", message)
+            self.message_log.scroll_to_bottom()
+            self._refresh_sidebar()
+
+        # Buffer output for DEPARTING conversations
+        if not is_active and conversation_id:
+            if conversation_id not in self._output_buffers:
+                self._output_buffers[conversation_id] = SubprocessOutputBuffer()
+            self._output_buffers[conversation_id].error = message
+            self._output_buffers[conversation_id].errored = True
+
+            # Persist immediately so the message survives even if the user
+            # never switches back.  Clear _raw_messages so reselection always
+            # reloads from persistence (avoids stale/duplicate cache entries).
+            self.persistence.add_message(conversation_id, "error", message)
+            self.message_log._raw_messages.pop(conversation_id, None)
 
     def _load_conversation_messages(self, conversation_id: str):
         """Load and append all messages for a conversation to the message log."""
-        self.message_log.clear()
-        messages = self.persistence.get_messages(conversation_id)
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            self.message_log.append_message(role, content, self._markdown_enabled)
-        self.message_log.scroll_to_bottom()
+        has_running = self.subprocess_mgr.is_conversation_running(conversation_id)
+        if self.message_log._raw_messages.get(conversation_id):
+            self.message_log.render_from_cache(conversation_id, self._markdown_enabled, preserve_content=has_running)
+        else:
+            messages = self.persistence.get_messages(conversation_id)
+            for msg in messages:
+                role = msg.get("role", "unknown")
+                msg_content = msg.get("content", "")
+                self.message_log.append_message(conversation_id, role, msg_content, self._markdown_enabled)
+            self.message_log.create_stderr_region(conversation_id)
+            self.message_log.scroll_to_bottom()
 
     def reset_active_state(self):
         """Reset all conversation state to prepare for a new conversation."""
-        self.persistence._active_conversation_id = None
-        self.message_log.clear()
+        # 1. Selectively terminate non-running conversations; preserve running ones
+        for cid in list(self._conversation_bindings.keys()):
+            if not self.subprocess_mgr.is_conversation_running(cid):
+                self.subprocess_mgr._terminate_conversation(cid)
+                self._disconnect_binding(cid)
+                self.message_log.clear_conversation_data(cid)
+        # 2. Clear all message log data
+        self.message_log._full_clear()
+        # 3. Clear persistence active state
+        self.persistence.clear_active_conversation()
+        # 4. Reset input bar
+        self.input_bar.set_enabled(True)
         self.input_bar._text_edit.clear()
+        self.input_bar_delegate._enabled_states.clear()
+        self.input_bar_delegate._running_states.clear()
+        # 5. Refresh sidebar
         self.sidebar._active_id = None
         self.sidebar.update_conversations(self.persistence.get_conversations())
 
+    def _flush_subprocess_buffer(self, cid: str) -> None:
+        """Drain-once flush buffered output on return-switch to a conversation.
+
+        Performs a synchronous stderr flush at the marker position, then appends
+        the assistant or error message AFTER the stderr content. Tracks message
+        boundaries so future timer-driven flushes do not overwrite appended messages.
+        """
+        if cid not in self._output_buffers:
+            return
+        buffer = self._output_buffers[cid]
+
+        # Merge buffer content with existing _stderr_buffers (preserves old-binding stderr)
+        buffer_content = buffer.stderr_chunks
+        existing = self.message_log._stderr_buffers.get(cid, '')
+        stderr_content = buffer_content + existing
+        self.message_log._stderr_buffers[cid] = stderr_content
+
+        # Synchronous stderr flush: write stderr at marker position BEFORE appending message
+        self.message_log._active_flush_cid = cid
+        marker = self.message_log._marker_positions.get(cid)
+        if marker is not None and stderr_content:
+            cursor = QTextCursor(self.message_log._text_edit.document())
+            cursor.setPosition(marker)
+            cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.insertText(stderr_content, self.message_log._stderr_fmt)
+            # Clear stderr buffer to prevent timer-driven duplicate writes
+            self.message_log._stderr_buffers[cid] = ''
+            # Record absolute message start position (marker + stderr length)
+            self.message_log._message_start_offsets[cid] = marker + len(stderr_content)
+            # Stop timer to prevent synchronous + timer-driven double-render (flicker)
+            self.message_log._stderr_flush_timer.stop()
+
+        # Check if the specific flushed content was already loaded from persistence (avoid duplicate append)
+        expected_role = "assistant" if buffer.completed else "error"
+        expected_content = buffer.stdout if buffer.completed else (buffer.error or "")
+        already_in_cache = cid in self.message_log._raw_messages and any(
+            r == expected_role and c == expected_content
+            for r, c in self.message_log._raw_messages.get(cid, [])
+        )
+
+        # Append flushed message to message log (skip if already loaded from persistence)
+        if not already_in_cache:
+            if buffer.completed and buffer.stdout:
+                self.message_log.append_message(cid, "assistant", buffer.stdout, self._markdown_enabled)
+                self.persistence.add_message(cid, "assistant", buffer.stdout)
+                self._refresh_sidebar()
+            elif buffer.errored and buffer.error:
+                self.message_log.append_message(cid, "error", buffer.error)
+                self.persistence.add_message(cid, "error", buffer.error)
+        else:
+            # Message already loaded from persistence — still refresh sidebar for completed
+            if buffer.completed:
+                self._refresh_sidebar()
+        # (No sidebar refresh for errored conversations — counts unchanged)
+
+        # Start timer only if there is stderr content (late chunks handled by append_stderr_chunk)
+        if stderr_content:
+            self.message_log._stderr_flush_timer.start()
+        self.message_log.scroll_to_bottom()
+
+        # Drain-once eviction
+        del self._output_buffers[cid]
+
     def on_conversation_selected(self, conversation_id: str):
         """Load and display messages for the selected conversation."""
+        # Same-conversation shortcut: no state changes if clicking the active tab
+        if self.sidebar._active_id == conversation_id:
+            return
+
+        # Check if the source conversation has a running subprocess
+        old_cid = self.sidebar._active_id
+        has_running = old_cid is not None and self.subprocess_mgr.is_conversation_running(old_cid)
+
+        # Disconnect and clear only if no subprocess is running (preserve binding for running ones)
+        if old_cid is not None and not has_running:
+            self._disconnect_binding(old_cid)
+            self.message_log.clear_conversation_data(old_cid)
+
+        # Activate new conversation and load its messages
         self.persistence.activate_conversation(conversation_id)
+        # Clear document before loading new conversation messages
+        self.message_log._stderr_flush_timer.stop()
+        self.message_log._text_edit.clear()
+        self.message_log._marker_positions.clear()
         self._load_conversation_messages(conversation_id)
+        # Flush any buffered output from a departed conversation (after marker is created)
+        if conversation_id in self._output_buffers:
+            self._flush_subprocess_buffer(conversation_id)
         self.sidebar.set_active_conversation(conversation_id)
+        self.input_bar_delegate.apply_state_to_widget(conversation_id)
+        self.message_log._active_flush_cid = conversation_id
 
     def _on_conversation_context_requested(self, conversation_id: str):
         """Open the conversation info modal on right-click."""
@@ -1797,3 +2164,18 @@ class ChatWindow(QWidget, _FramelessMixin):
         conv_id = self.persistence.get_active_conversation_id()
         if conv_id:
             self._load_conversation_messages(conv_id)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Terminate all subprocesses via SubprocessManager and disconnect permanent bindings as the sole disconnection point before closing."""
+        # (i) Detect and terminate orphaned subprocesses
+        _ = self.subprocess_mgr.detect_orphaned_subprocesses()
+        # (ii) Terminate all running subprocesses (orphans already have running=False)
+        self.subprocess_mgr.terminate_running_conversations()
+        # (iii) Disconnect all signal bindings
+        for cid in list(self._conversation_bindings):
+            self._disconnect_binding(cid)
+        # (iv) Remove terminated entries that persist in _conversations
+        self.subprocess_mgr.clear_all()
+        # (v) Accept the close event
+        super().closeEvent(event)
+
